@@ -1,124 +1,216 @@
-"""Support for Essent API."""
-from datetime import timedelta
+"""Sensor platform for Essent integration."""
 
-from pyessent import PyEssent
-import voluptuous as vol
+from __future__ import annotations
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, ENERGY_KILO_WATT_HOUR
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
-from homeassistant.util import Throttle
+from collections.abc import Callable
+from dataclasses import dataclass
+import logging
+from typing import Any
 
-SCAN_INTERVAL = timedelta(hours=1)
+from essent_dynamic_pricing.models import EnergyData, Tariff
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_USERNAME): cv.string, vol.Required(CONF_PASSWORD): cv.string}
+from homeassistant.components.sensor import (
+    EntityCategory,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.const import CURRENCY_EURO
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
+
+from .const import EnergyType, PriceGroup
+from .coordinator import EssentConfigEntry, EssentDataUpdateCoordinator
+from .entity import EssentEntity
+
+_LOGGER = logging.getLogger(__name__)
+
+PARALLEL_UPDATES = 1
+
+
+@dataclass(frozen=True, kw_only=True)
+class EssentSensorEntityDescription(SensorEntityDescription):
+    """Describe an Essent sensor."""
+
+    value_fn: Callable[[EnergyData], float | None]
+    energy_types: tuple[EnergyType, ...] = (EnergyType.ELECTRICITY, EnergyType.GAS)
+
+
+def _get_all_tariffs(data: EnergyData) -> list[Tariff]:
+    """Return tariffs for both today and tomorrow."""
+    return [*data.tariffs, *data.tariffs_tomorrow]
+
+
+def _get_current_tariff(data: EnergyData) -> Tariff | None:
+    """Return the currently active tariff."""
+    now = dt_util.now()
+    for tariff in _get_all_tariffs(data):
+        if tariff.start is None or tariff.end is None:
+            continue
+        if tariff.start <= now < tariff.end:
+            return tariff
+    _LOGGER.debug("No current tariff found")
+    return None
+
+
+def _get_next_tariff(data: EnergyData) -> Tariff | None:
+    """Return the next tariff."""
+    now = dt_util.now()
+    for tariff in _get_all_tariffs(data):
+        if tariff.start is None:
+            continue
+        if tariff.start > now:
+            return tariff
+    _LOGGER.debug("No upcoming tariff found")
+    return None
+
+
+def _get_current_tariff_groups(
+    data: EnergyData,
+) -> tuple[Tariff | None, dict[str, Any]]:
+    """Return the current tariff and grouped amounts."""
+    if (tariff := _get_current_tariff(data)) is None:
+        return None, {}
+    groups = {
+        group["type"]: group.get("amount") for group in tariff.groups if "type" in group
+    }
+    return tariff, groups
+
+
+SENSORS: tuple[EssentSensorEntityDescription, ...] = (
+    EssentSensorEntityDescription(
+        key="current_price",
+        translation_key="current_price",
+        value_fn=lambda energy_data: (
+            None
+            if (tariff := _get_current_tariff(energy_data)) is None
+            else tariff.total_amount
+        ),
+    ),
+    EssentSensorEntityDescription(
+        key="next_price",
+        translation_key="next_price",
+        value_fn=lambda energy_data: (
+            None
+            if (tariff := _get_next_tariff(energy_data)) is None
+            else tariff.total_amount
+        ),
+        entity_registry_enabled_default=False,
+    ),
+    EssentSensorEntityDescription(
+        key="average_today",
+        translation_key="average_today",
+        value_fn=lambda energy_data: energy_data.avg_price,
+        energy_types=(EnergyType.ELECTRICITY,),
+    ),
+    EssentSensorEntityDescription(
+        key="lowest_price_today",
+        translation_key="lowest_price_today",
+        value_fn=lambda energy_data: energy_data.min_price,
+        energy_types=(EnergyType.ELECTRICITY,),
+        entity_registry_enabled_default=False,
+    ),
+    EssentSensorEntityDescription(
+        key="highest_price_today",
+        translation_key="highest_price_today",
+        value_fn=lambda energy_data: energy_data.max_price,
+        energy_types=(EnergyType.ELECTRICITY,),
+        entity_registry_enabled_default=False,
+    ),
+    EssentSensorEntityDescription(
+        key="current_price_ex_vat",
+        translation_key="current_price_ex_vat",
+        value_fn=lambda energy_data: (
+            None
+            if (tariff := _get_current_tariff(energy_data)) is None
+            else tariff.total_amount_ex
+        ),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EssentSensorEntityDescription(
+        key="current_price_vat",
+        translation_key="current_price_vat",
+        value_fn=lambda energy_data: (
+            None
+            if (tariff := _get_current_tariff(energy_data)) is None
+            # VAT is exposed as tariff.total_amount_vat, not as a tariff group
+            else tariff.total_amount_vat
+        ),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EssentSensorEntityDescription(
+        key="current_price_market_price",
+        translation_key="current_price_market_price",
+        value_fn=lambda energy_data: _get_current_tariff_groups(energy_data)[1].get(
+            PriceGroup.MARKET_PRICE
+        ),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EssentSensorEntityDescription(
+        key="current_price_purchasing_fee",
+        translation_key="current_price_purchasing_fee",
+        value_fn=lambda energy_data: _get_current_tariff_groups(energy_data)[1].get(
+            PriceGroup.PURCHASING_FEE
+        ),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EssentSensorEntityDescription(
+        key="current_price_tax",
+        translation_key="current_price_tax",
+        value_fn=lambda energy_data: _get_current_tariff_groups(energy_data)[1].get(
+            PriceGroup.TAX
+        ),
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
 )
 
 
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    """Set up the Essent platform."""
-    username = config[CONF_USERNAME]
-    password = config[CONF_PASSWORD]
-
-    essent = EssentBase(username, password)
-    meters = []
-    for meter in essent.retrieve_meters():
-        data = essent.retrieve_meter_data(meter)
-        for tariff in data["values"]["LVR"].keys():
-            meters.append(
-                EssentMeter(
-                    essent,
-                    meter,
-                    data["type"],
-                    tariff,
-                    data["values"]["LVR"][tariff]["unit"],
-                )
-            )
-
-    if not meters:
-        hass.components.persistent_notification.create(
-            "Couldn't find any meter readings. "
-            "Please ensure Verbruiks Manager is enabled in Mijn Essent "
-            "and at least one reading has been logged to Meterstanden.",
-            title="Essent",
-            notification_id="essent_notification",
-        )
-        return
-
-    add_devices(meters, True)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: EssentConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Essent sensors."""
+    coordinator = entry.runtime_data
+    async_add_entities(
+        EssentSensor(coordinator, energy_type, description)
+        for description in SENSORS
+        for energy_type in description.energy_types
+    )
 
 
-class EssentBase:
-    """Essent Base."""
+class EssentSensor(EssentEntity, SensorEntity):
+    """Generic Essent sensor driven by entity descriptions."""
 
-    def __init__(self, username, password):
-        """Initialize the Essent API."""
-        self._username = username
-        self._password = password
-        self._meter_data = {}
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 3
 
-        self.update()
+    entity_description: EssentSensorEntityDescription
 
-    def retrieve_meters(self):
-        """Retrieve the list of meters."""
-        return self._meter_data.keys()
-
-    def retrieve_meter_data(self, meter):
-        """Retrieve the data for this meter."""
-        return self._meter_data[meter]
-
-    @Throttle(timedelta(minutes=30))
-    def update(self):
-        """Retrieve the latest meter data from Essent."""
-        essent = PyEssent(self._username, self._password)
-        eans = essent.get_EANs()
-        for possible_meter in eans:
-            meter_data = essent.read_meter(possible_meter, only_last_meter_reading=True)
-            if meter_data:
-                self._meter_data[possible_meter] = meter_data
-
-
-class EssentMeter(Entity):
-    """Representation of Essent measurements."""
-
-    def __init__(self, essent_base, meter, meter_type, tariff, unit):
+    def __init__(
+        self,
+        coordinator: EssentDataUpdateCoordinator,
+        energy_type: EnergyType,
+        description: EssentSensorEntityDescription,
+    ) -> None:
         """Initialize the sensor."""
-        self._state = None
-        self._essent_base = essent_base
-        self._meter = meter
-        self._type = meter_type
-        self._tariff = tariff
-        self._unit = unit
+        super().__init__(coordinator, energy_type)
+        self.entity_description = description
+        self._attr_unique_id = f"{energy_type}-{description.key}"
+        self._attr_translation_key = f"{energy_type}_{description.translation_key}"
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return f"Essent {self._type} ({self._tariff})"
+    def native_value(self) -> float | None:
+        """Return the current value."""
+        return self.entity_description.value_fn(self.energy_data)
 
     @property
-    def state(self):
-        """Return the state of the sensor."""
-        return self._state
-
-    @property
-    def unit_of_measurement(self):
+    def native_unit_of_measurement(self) -> str:
         """Return the unit of measurement."""
-        if self._unit.lower() == "kwh":
-            return ENERGY_KILO_WATT_HOUR
-
-        return self._unit
-
-    def update(self):
-        """Fetch the energy usage."""
-        # Ensure our data isn't too old
-        self._essent_base.update()
-
-        # Retrieve our meter
-        data = self._essent_base.retrieve_meter_data(self._meter)
-
-        # Set our value
-        self._state = next(
-            iter(data["values"]["LVR"][self._tariff]["records"].values())
-        )
+        return f"{CURRENCY_EURO}/{self.energy_data.unit}"

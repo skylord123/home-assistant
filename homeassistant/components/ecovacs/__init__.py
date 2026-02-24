@@ -1,91 +1,63 @@
 """Support for Ecovacs Deebot vacuums."""
-import logging
-import random
-import string
 
-from sucks import EcoVacsAPI, VacBot
-import voluptuous as vol
+from sucks import VacBot
 
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, EVENT_HOMEASSISTANT_STOP
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN
+from .controller import EcovacsController
+from .services import async_setup_services
 
-DOMAIN = "ecovacs"
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.EVENT,
+    Platform.IMAGE,
+    Platform.LAWN_MOWER,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.VACUUM,
+]
+type EcovacsConfigEntry = ConfigEntry[EcovacsController]
 
-CONF_COUNTRY = "country"
-CONF_CONTINENT = "continent"
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_USERNAME): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
-                vol.Required(CONF_COUNTRY): vol.All(vol.Lower, cv.string),
-                vol.Required(CONF_CONTINENT): vol.All(vol.Lower, cv.string),
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-ECOVACS_DEVICES = "ecovacs_devices"
-
-# Generate a random device ID on each bootup
-ECOVACS_API_DEVICEID = "".join(
-    random.choice(string.ascii_uppercase + string.digits) for _ in range(8)
-)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-def setup(hass, config):
-    """Set up the Ecovacs component."""
-    _LOGGER.debug("Creating new Ecovacs component")
-
-    hass.data[ECOVACS_DEVICES] = []
-
-    ecovacs_api = EcoVacsAPI(
-        ECOVACS_API_DEVICEID,
-        config[DOMAIN].get(CONF_USERNAME),
-        EcoVacsAPI.md5(config[DOMAIN].get(CONF_PASSWORD)),
-        config[DOMAIN].get(CONF_COUNTRY),
-        config[DOMAIN].get(CONF_CONTINENT),
-    )
-
-    devices = ecovacs_api.devices()
-    _LOGGER.debug("Ecobot devices: %s", devices)
-
-    for device in devices:
-        _LOGGER.info(
-            "Discovered Ecovacs device on account: %s with nickname %s",
-            device["did"],
-            device["nick"],
-        )
-        vacbot = VacBot(
-            ecovacs_api.uid,
-            ecovacs_api.REALM,
-            ecovacs_api.resource,
-            ecovacs_api.user_access_token,
-            device,
-            config[DOMAIN].get(CONF_CONTINENT).lower(),
-            monitor=True,
-        )
-        hass.data[ECOVACS_DEVICES].append(vacbot)
-
-    def stop(event: object) -> None:
-        """Shut down open connections to Ecovacs XMPP server."""
-        for device in hass.data[ECOVACS_DEVICES]:
-            _LOGGER.info(
-                "Shutting down connection to Ecovacs device %s", device.vacuum["did"]
-            )
-            device.disconnect()
-
-    # Listen for HA stop to disconnect.
-    hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, stop)
-
-    if hass.data[ECOVACS_DEVICES]:
-        _LOGGER.debug("Starting vacuum components")
-        discovery.load_platform(hass, "vacuum", DOMAIN, {}, config)
-
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the component."""
+    async_setup_services(hass)
     return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> bool:
+    """Set up this integration using UI."""
+    controller = EcovacsController(hass, entry.data)
+
+    entry.async_on_unload(controller.teardown)
+
+    await controller.initialize()
+
+    entry.runtime_data = controller
+
+    async def _async_wait_connect(device: VacBot) -> None:
+        await hass.async_add_executor_job(device.connect_and_wait_until_ready)
+
+    for device in controller.legacy_devices:
+        entry.async_create_background_task(
+            hass=hass,
+            target=_async_wait_connect(device),
+            name=f"{entry.title}_wait_connect_{device.vacuum['did']}",
+        )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> bool:
+    """Unload config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

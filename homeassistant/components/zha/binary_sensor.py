@@ -1,179 +1,59 @@
 """Binary sensors on Zigbee Home Automation networks."""
-import logging
+
+from __future__ import annotations
+
+import functools
 
 from homeassistant.components.binary_sensor import (
-    DEVICE_CLASS_GAS,
-    DEVICE_CLASS_MOISTURE,
-    DEVICE_CLASS_MOTION,
-    DEVICE_CLASS_MOVING,
-    DEVICE_CLASS_OCCUPANCY,
-    DEVICE_CLASS_OPENING,
-    DEVICE_CLASS_SMOKE,
-    DEVICE_CLASS_VIBRATION,
-    DOMAIN,
-    BinarySensorDevice,
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
 )
-from homeassistant.const import STATE_ON
-from homeassistant.core import callback
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .core.const import (
-    CHANNEL_ATTRIBUTE,
-    CHANNEL_ON_OFF,
-    CHANNEL_ZONE,
-    DATA_ZHA,
-    DATA_ZHA_DISPATCHERS,
-    SENSOR_ACCELERATION,
-    SENSOR_OCCUPANCY,
-    SENSOR_OPENING,
-    SENSOR_TYPE,
-    SIGNAL_ATTR_UPDATED,
-    UNKNOWN,
-    ZHA_DISCOVERY_NEW,
-    ZONE,
+from .entity import ZHAEntity
+from .helpers import (
+    SIGNAL_ADD_ENTITIES,
+    EntityData,
+    async_add_entities as zha_async_add_entities,
+    get_zha_data,
 )
-from .entity import ZhaEntity
-
-_LOGGER = logging.getLogger(__name__)
-
-# Zigbee Cluster Library Zone Type to Home Assistant device class
-CLASS_MAPPING = {
-    0x000D: DEVICE_CLASS_MOTION,
-    0x0015: DEVICE_CLASS_OPENING,
-    0x0028: DEVICE_CLASS_SMOKE,
-    0x002A: DEVICE_CLASS_MOISTURE,
-    0x002B: DEVICE_CLASS_GAS,
-    0x002D: DEVICE_CLASS_VIBRATION,
-}
 
 
-async def get_ias_device_class(channel):
-    """Get the HA device class from the channel."""
-    zone_type = await channel.get_attribute_value("zone_type")
-    return CLASS_MAPPING.get(zone_type)
-
-
-DEVICE_CLASS_REGISTRY = {
-    UNKNOWN: None,
-    SENSOR_OPENING: DEVICE_CLASS_OPENING,
-    ZONE: get_ias_device_class,
-    SENSOR_OCCUPANCY: DEVICE_CLASS_OCCUPANCY,
-    SENSOR_ACCELERATION: DEVICE_CLASS_MOVING,
-}
-
-
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Old way of setting up Zigbee Home Automation binary sensors."""
-    pass
-
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the Zigbee Home Automation binary sensor from config entry."""
-
-    async def async_discover(discovery_info):
-        await _async_setup_entities(
-            hass, config_entry, async_add_entities, [discovery_info]
-        )
+    zha_data = get_zha_data(hass)
+    entities_to_create = zha_data.platforms[Platform.BINARY_SENSOR]
 
     unsub = async_dispatcher_connect(
-        hass, ZHA_DISCOVERY_NEW.format(DOMAIN), async_discover
+        hass,
+        SIGNAL_ADD_ENTITIES,
+        functools.partial(
+            zha_async_add_entities, async_add_entities, BinarySensor, entities_to_create
+        ),
     )
-    hass.data[DATA_ZHA][DATA_ZHA_DISPATCHERS].append(unsub)
-
-    binary_sensors = hass.data.get(DATA_ZHA, {}).get(DOMAIN)
-    if binary_sensors is not None:
-        await _async_setup_entities(
-            hass, config_entry, async_add_entities, binary_sensors.values()
-        )
-        del hass.data[DATA_ZHA][DOMAIN]
+    config_entry.async_on_unload(unsub)
 
 
-async def _async_setup_entities(
-    hass, config_entry, async_add_entities, discovery_infos
-):
-    """Set up the ZHA binary sensors."""
-    entities = []
-    for discovery_info in discovery_infos:
-        entities.append(BinarySensor(**discovery_info))
-
-    async_add_entities(entities, update_before_add=True)
-
-
-class BinarySensor(ZhaEntity, BinarySensorDevice):
+class BinarySensor(ZHAEntity, BinarySensorEntity):
     """ZHA BinarySensor."""
 
-    _domain = DOMAIN
-    _device_class = None
-
-    def __init__(self, **kwargs):
+    def __init__(self, entity_data: EntityData) -> None:
         """Initialize the ZHA binary sensor."""
-        super().__init__(**kwargs)
-        self._device_state_attributes = {}
-        self._zone_channel = self.cluster_channels.get(CHANNEL_ZONE)
-        self._on_off_channel = self.cluster_channels.get(CHANNEL_ON_OFF)
-        self._attr_channel = self.cluster_channels.get(CHANNEL_ATTRIBUTE)
-        self._zha_sensor_type = kwargs[SENSOR_TYPE]
-
-    async def _determine_device_class(self):
-        """Determine the device class for this binary sensor."""
-        device_class_supplier = DEVICE_CLASS_REGISTRY.get(self._zha_sensor_type)
-        if callable(device_class_supplier):
-            channel = self.cluster_channels.get(self._zha_sensor_type)
-            if channel is None:
-                return None
-            return await device_class_supplier(channel)
-        return device_class_supplier
-
-    async def async_added_to_hass(self):
-        """Run when about to be added to hass."""
-        self._device_class = await self._determine_device_class()
-        await super().async_added_to_hass()
-        if self._on_off_channel:
-            await self.async_accept_signal(
-                self._on_off_channel, SIGNAL_ATTR_UPDATED, self.async_set_state
+        super().__init__(entity_data)
+        if self.entity_data.entity.info_object.device_class is not None:
+            self._attr_device_class = BinarySensorDeviceClass(
+                self.entity_data.entity.info_object.device_class
             )
-        if self._zone_channel:
-            await self.async_accept_signal(
-                self._zone_channel, SIGNAL_ATTR_UPDATED, self.async_set_state
-            )
-        if self._attr_channel:
-            await self.async_accept_signal(
-                self._attr_channel, SIGNAL_ATTR_UPDATED, self.async_set_state
-            )
-
-    @callback
-    def async_restore_last_state(self, last_state):
-        """Restore previous state."""
-        super().async_restore_last_state(last_state)
-        self._state = last_state.state == STATE_ON
 
     @property
     def is_on(self) -> bool:
-        """Return if the switch is on based on the statemachine."""
-        if self._state is None:
-            return False
-        return self._state
-
-    @property
-    def device_class(self) -> str:
-        """Return device class from component DEVICE_CLASSES."""
-        return self._device_class
-
-    def async_set_state(self, state):
-        """Set the state."""
-        self._state = bool(state)
-        self.async_schedule_update_ha_state()
-
-    async def async_update(self):
-        """Attempt to retrieve on off state from the binary sensor."""
-        await super().async_update()
-        if self._on_off_channel:
-            self._state = await self._on_off_channel.get_attribute_value("on_off")
-        if self._zone_channel:
-            value = await self._zone_channel.get_attribute_value("zone_status")
-            if value is not None:
-                self._state = value & 3
-        if self._attr_channel:
-            self._state = await self._attr_channel.get_attribute_value(
-                self._attr_channel.value_attribute
-            )
+        """Return True if the switch is on based on the state machine."""
+        return self.entity_data.entity.is_on

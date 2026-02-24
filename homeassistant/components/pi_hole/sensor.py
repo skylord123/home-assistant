@@ -1,80 +1,180 @@
 """Support for getting statistical data from a Pi-hole system."""
-import logging
 
-from homeassistant.helpers.entity import Entity
+from __future__ import annotations
 
-from .const import (
-    DOMAIN as PIHOLE_DOMAIN,
-    ATTR_BLOCKED_DOMAINS,
-    SENSOR_LIST,
-    SENSOR_DICT,
+from collections.abc import Mapping
+from typing import Any
+
+from hole import Hole
+
+from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
+from homeassistant.const import CONF_NAME, PERCENTAGE
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import StateType
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+from . import PiHoleConfigEntry
+from .entity import PiHoleEntity
+
+SENSOR_TYPES: tuple[SensorEntityDescription, ...] = (
+    SensorEntityDescription(
+        key="ads_blocked_today",
+        translation_key="ads_blocked_today",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="ads_percentage_today",
+        translation_key="ads_percentage_today",
+        native_unit_of_measurement=PERCENTAGE,
+        suggested_display_precision=1,
+    ),
+    SensorEntityDescription(
+        key="clients_ever_seen",
+        translation_key="clients_ever_seen",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="dns_queries_today",
+        translation_key="dns_queries_today",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="domains_being_blocked",
+        translation_key="domains_being_blocked",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries_cached",
+        translation_key="queries_cached",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries_forwarded",
+        translation_key="queries_forwarded",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="unique_clients",
+        translation_key="unique_clients",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="unique_domains",
+        translation_key="unique_domains",
+        suggested_display_precision=0,
+    ),
 )
 
-LOGGER = logging.getLogger(__name__)
+SENSOR_TYPES_V6: tuple[SensorEntityDescription, ...] = (
+    SensorEntityDescription(
+        key="queries.blocked",
+        translation_key="ads_blocked",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries.percent_blocked",
+        translation_key="percent_ads_blocked",
+        native_unit_of_measurement=PERCENTAGE,
+        suggested_display_precision=2,
+    ),
+    SensorEntityDescription(
+        key="clients.total",
+        translation_key="clients_ever_seen",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries.total",
+        translation_key="dns_queries",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="gravity.domains_being_blocked",
+        translation_key="domains_being_blocked",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries.cached",
+        translation_key="queries_cached",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries.forwarded",
+        translation_key="queries_forwarded",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="clients.active",
+        translation_key="unique_clients",
+        suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="queries.unique_domains",
+        translation_key="unique_domains",
+        suggested_display_precision=0,
+    ),
+)
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the pi-hole sensor."""
-    if discovery_info is None:
-        return
-
-    pi_hole = hass.data[PIHOLE_DOMAIN]
-
-    sensors = []
-    sensors = [PiHoleSensor(pi_hole, sensor_name) for sensor_name in SENSOR_LIST]
-
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: PiHoleConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Pi-hole sensor."""
+    name = entry.data[CONF_NAME]
+    hole_data = entry.runtime_data
+    sensors = [
+        PiHoleSensor(
+            hole_data.api,
+            hole_data.coordinator,
+            name,
+            entry.entry_id,
+            description,
+        )
+        for description in (
+            SENSOR_TYPES if hole_data.api_version == 5 else SENSOR_TYPES_V6
+        )
+    ]
     async_add_entities(sensors, True)
 
 
-class PiHoleSensor(Entity):
+class PiHoleSensor(PiHoleEntity, SensorEntity):
     """Representation of a Pi-hole sensor."""
 
-    def __init__(self, pi_hole, sensor_name):
+    entity_description: SensorEntityDescription
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        api: Hole,
+        coordinator: DataUpdateCoordinator[None],
+        name: str,
+        server_unique_id: str,
+        description: SensorEntityDescription,
+    ) -> None:
         """Initialize a Pi-hole sensor."""
-        self.pi_hole = pi_hole
-        self._name = pi_hole.name
-        self._condition = sensor_name
+        super().__init__(api, coordinator, name, server_unique_id)
+        self.entity_description = description
 
-        variable_info = SENSOR_DICT[sensor_name]
-        self._condition_name = variable_info[0]
-        self._unit_of_measurement = variable_info[1]
-        self._icon = variable_info[2]
-        self.data = {}
+        self._attr_unique_id = f"{self._server_unique_id}/{description.key}"
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return f"{self._name} {self._condition_name}"
-
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return self._icon
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit the value is expressed in."""
-        return self._unit_of_measurement
-
-    @property
-    def state(self):
+    def native_value(self) -> StateType:
         """Return the state of the device."""
-        try:
-            return round(self.data[self._condition], 2)
-        except TypeError:
-            return self.data[self._condition]
+        return get_nested(self.api.data, self.entity_description.key)
 
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes of the Pi-Hole."""
-        return {ATTR_BLOCKED_DOMAINS: self.data["domains_being_blocked"]}
 
-    @property
-    def available(self):
-        """Could the device be accessed during the last update call."""
-        return self.pi_hole.available
+def get_nested(data: Mapping[str, Any], key: str) -> float | int:
+    """Get a value from a nested dictionary using a dot-separated key.
 
-    async def async_update(self):
-        """Get the latest data from the Pi-hole API."""
-        await self.pi_hole.async_update()
-        self.data = self.pi_hole.api.data
+    Ensures type safety as it iterates into the dict.
+    """
+    current: Any = data
+    for part in key.split("."):
+        if not isinstance(current, Mapping):
+            raise KeyError(f"Cannot access '{part}' in non-dict {current!r}")
+        current = current[part]
+    if not isinstance(current, (float, int)):
+        raise TypeError(f"Value at '{key}' is not a float or int: {current!r}")
+    return current

@@ -1,71 +1,100 @@
 # Describes the format for available SimpliSafe services
-
----
 remove_pin:
-  description: Remove a PIN by its label or value.
   fields:
-    system_id:
-      description: The SimpliSafe system ID to affect.
-      example: 123987
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: simplisafe
+          entity:
+            domain: alarm_control_panel
     label_or_pin:
-      description: The label/value to remove.
+      required: true
       example: Test PIN
-set_alarm_duration:
-  description: "Set the duration (in seconds) of an active alarm"
-  fields:
-    system_id:
-      description: The SimpliSafe system ID to affect
-      example: 123987
-    seconds:
-      description: The number of seconds to sound the alarm
-      example: 120
-set_delay:
-  description: >
-    Set a duration for how long the base station should delay when transitioning
-    between states
-  fields:
-    system_id:
-      description: The SimpliSafe system ID to affect
-      example: 123987
-    arrival_state:
-      description: The target "arrival" state (away, home)
-      example: away
-    transition:
-      description: The system state transition to affect (entry, exit)
-      example: exit
-    seconds:
-      description: "The number of seconds to delay"
-      example: 120
-set_light:
-  description: "Turn the base station light on/off"
-  fields:
-    system_id:
-      description: The SimpliSafe system ID to affect
-      example: 123987
-    armed_light_state:
-      description: "True for on, False for off"
-      example: "True"
+      selector:
+        text:
 set_pin:
-  description: Set/update a PIN
   fields:
-    system_id:
-      description: The SimpliSafe system ID to affect
-      example: 123987
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: simplisafe
+          entity:
+            domain: alarm_control_panel
     label:
-      description: The label of the PIN
+      required: true
       example: Test PIN
+      selector:
+        text:
     pin:
-      description: The value of the PIN
+      required: true
       example: 1256
-set_volume_property:
-  description: Set a level for one of the base station's various volumes
+      selector:
+        text:
+set_system_properties:
   fields:
-    system_id:
-      description: The SimpliSafe system ID to affect
-      example: 123987
-    volume_property:
-      description: The volume property to set (alarm, chime, voice_prompt)
-      example: voice_prompt
-    volume:
-      description: "A volume (off, low, medium, high)"
-      example: low
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: simplisafe
+          entity:
+            domain: alarm_control_panel
+    alarm_duration:
+      selector:
+        number:
+          min: 30
+          max: 480
+          unit_of_measurement: seconds
+    alarm_volume:
+      selector:
+        select:
+          options:
+            - "low"
+            - "medium"
+            - "high"
+            - "off"
+    chime_volume:
+      selector:
+        select:
+          options:
+            - "low"
+            - "medium"
+            - "high"
+            - "off"
+    entry_delay_away:
+      selector:
+        number:
+          min: 30
+          max: 255
+          unit_of_measurement: seconds
+    entry_delay_home:
+      selector:
+        number:
+          min: 0
+          max: 255
+          unit_of_measurement: seconds
+    exit_delay_away:
+      selector:
+        number:
+          min: 45
+          max: 255
+          unit_of_measurement: seconds
+    exit_delay_home:
+      selector:
+        number:
+          min: 0
+          max: 255
+          unit_of_measurement: seconds
+    light:
+      selector:
+        boolean:
+    voice_prompt_volume:
+      selector:
+        select:
+          options:
+            - "low"
+            - "medium"
+            - "high"
+            - "off"

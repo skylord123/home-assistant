@@ -1,15 +1,26 @@
-"""This component provides HA switch support for Ring Door Bell/Chimes."""
-import logging
-from datetime import timedelta
-from homeassistant.components.light import Light
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.core import callback
-import homeassistant.util.dt as dt_util
+"""Component providing HA switch support for Ring Door Bell/Chimes."""
 
-from . import DATA_RING_STICKUP_CAMS, SIGNAL_UPDATE_RING
+from datetime import timedelta
+from enum import StrEnum, auto
+import logging
+from typing import Any
+
+from ring_doorbell import RingStickUpCam
+
+from homeassistant.components.light import ColorMode, LightEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
+
+from . import RingConfigEntry
+from .coordinator import RingDataCoordinator
+from .entity import RingEntity, exception_wrap
 
 _LOGGER = logging.getLogger(__name__)
 
+# Coordinator is used to centralize the data updates
+# Actions restricted to 1 at a time
+PARALLEL_UPDATES = 1
 
 # It takes a few seconds for the API to correctly return an update indicating
 # that the changes have been made. Once we request a change (i.e. a light
@@ -18,81 +29,70 @@ _LOGGER = logging.getLogger(__name__)
 
 SKIP_UPDATES_DELAY = timedelta(seconds=5)
 
-ON_STATE = "on"
-OFF_STATE = "off"
+
+class OnOffState(StrEnum):
+    """Enum for allowed on off states."""
+
+    ON = auto()
+    OFF = auto()
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: RingConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Create the lights for the Ring devices."""
-    cameras = hass.data[DATA_RING_STICKUP_CAMS]
-    lights = []
+    ring_data = entry.runtime_data
+    devices_coordinator = ring_data.devices_coordinator
 
-    for device in cameras:
-        if device.has_capability("light"):
-            lights.append(RingLight(device))
+    async_add_entities(
+        RingLight(device, devices_coordinator)
+        for device in ring_data.devices.stickup_cams
+        if device.has_capability("light")
+    )
 
-    add_entities(lights, True)
 
-
-class RingLight(Light):
+class RingLight(RingEntity[RingStickUpCam], LightEntity):
     """Creates a switch to turn the ring cameras light on and off."""
 
-    def __init__(self, device):
+    _attr_color_mode = ColorMode.ONOFF
+    _attr_supported_color_modes = {ColorMode.ONOFF}
+    _attr_translation_key = "light"
+
+    def __init__(
+        self, device: RingStickUpCam, coordinator: RingDataCoordinator
+    ) -> None:
         """Initialize the light."""
-        self._device = device
-        self._unique_id = self._device.id
-        self._light_on = False
+        super().__init__(device, coordinator)
+        self._attr_unique_id = str(device.id)
+        self._attr_is_on = device.lights == OnOffState.ON
         self._no_updates_until = dt_util.utcnow()
 
-    async def async_added_to_hass(self):
-        """Register callbacks."""
-        async_dispatcher_connect(self.hass, SIGNAL_UPDATE_RING, self._update_callback)
-
     @callback
-    def _update_callback(self):
+    def _handle_coordinator_update(self) -> None:
         """Call update method."""
-        _LOGGER.debug("Updating Ring light %s (callback)", self.name)
-        self.async_schedule_update_ha_state(True)
-
-    @property
-    def name(self):
-        """Name of the light."""
-        return f"{self._device.name} light"
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return self._unique_id
-
-    @property
-    def should_poll(self):
-        """Update controlled via the hub."""
-        return False
-
-    @property
-    def is_on(self):
-        """If the switch is currently on or off."""
-        return self._light_on
-
-    def _set_light(self, new_state):
-        """Update light state, and causes HASS to correctly update."""
-        self._device.lights = new_state
-        self._light_on = new_state == ON_STATE
-        self._no_updates_until = dt_util.utcnow() + SKIP_UPDATES_DELAY
-        self.async_schedule_update_ha_state(True)
-
-    def turn_on(self, **kwargs):
-        """Turn the light on for 30 seconds."""
-        self._set_light(ON_STATE)
-
-    def turn_off(self, **kwargs):
-        """Turn the light off."""
-        self._set_light(OFF_STATE)
-
-    def update(self):
-        """Update current state of the light."""
         if self._no_updates_until > dt_util.utcnow():
-            _LOGGER.debug("Skipping update...")
             return
+        device = self._get_coordinator_data().get_stickup_cam(
+            self._device.device_api_id
+        )
+        self._attr_is_on = device.lights == OnOffState.ON
+        super()._handle_coordinator_update()
 
-        self._light_on = self._device.lights == ON_STATE
+    @exception_wrap
+    async def _async_set_light(self, new_state: OnOffState) -> None:
+        """Update light state, and causes Home Assistant to correctly update."""
+        await self._device.async_set_lights(new_state)
+
+        self._attr_is_on = new_state == OnOffState.ON
+        self._no_updates_until = dt_util.utcnow() + SKIP_UPDATES_DELAY
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the light on for 30 seconds."""
+        await self._async_set_light(OnOffState.ON)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the light off."""
+        await self._async_set_light(OnOffState.OFF)

@@ -1,13 +1,18 @@
-"""Support for Traccar."""
+"""Support for Traccar Client."""
+
+from http import HTTPStatus
+from json import JSONDecodeError
 import logging
 
 from aiohttp import web
 import voluptuous as vol
+from voluptuous.humanize import humanize_error
 
-from homeassistant.components.device_tracker import DOMAIN as DEVICE_TRACKER
-from homeassistant.const import CONF_WEBHOOK_ID, HTTP_OK, HTTP_UNPROCESSABLE_ENTITY
-from homeassistant.helpers import config_entry_flow
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components import webhook
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_ID, CONF_WEBHOOK_ID, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_entry_flow, config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
@@ -15,18 +20,18 @@ from .const import (
     ATTR_ALTITUDE,
     ATTR_BATTERY,
     ATTR_BEARING,
-    ATTR_ID,
     ATTR_LATITUDE,
     ATTR_LONGITUDE,
     ATTR_SPEED,
-    ATTR_TIMESTAMP,
     DOMAIN,
 )
 
-_LOGGER = logging.getLogger(__name__)
+PLATFORMS = [Platform.DEVICE_TRACKER]
+
 
 TRACKER_UPDATE = f"{DOMAIN}_tracker_update"
 
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_ACCURACY = 200
 DEFAULT_BATTERY = -1
@@ -47,23 +52,51 @@ WEBHOOK_SCHEMA = vol.Schema(
         vol.Optional(ATTR_BATTERY, default=DEFAULT_BATTERY): vol.Coerce(float),
         vol.Optional(ATTR_BEARING): vol.Coerce(float),
         vol.Optional(ATTR_SPEED): vol.Coerce(float),
-        vol.Optional(ATTR_TIMESTAMP): vol.Coerce(int),
-    }
+    },
+    extra=vol.REMOVE_EXTRA,
 )
 
 
-async def async_setup(hass, hass_config):
-    """Set up the Traccar component."""
-    hass.data[DOMAIN] = {"devices": set(), "unsub_device_tracker": {}}
-    return True
+def _parse_json_body(json_body: dict) -> dict:
+    """Parse JSON body from request."""
+    location = json_body.get("location", {})
+    coords = location.get("coords", {})
+    battery_level = location.get("battery", {}).get("level")
+    return {
+        "id": json_body.get("device_id"),
+        "lat": coords.get("latitude"),
+        "lon": coords.get("longitude"),
+        "accuracy": coords.get("accuracy"),
+        "altitude": coords.get("altitude"),
+        "batt": battery_level * 100 if battery_level is not None else DEFAULT_BATTERY,
+        "bearing": coords.get("heading"),
+        "speed": coords.get("speed"),
+    }
 
 
-async def handle_webhook(hass, webhook_id, request):
-    """Handle incoming webhook with Traccar request."""
+async def handle_webhook(
+    hass: HomeAssistant,
+    webhook_id: str,
+    request: web.Request,
+) -> web.Response:
+    """Handle incoming webhook with Traccar Client request."""
+    if not (requestdata := dict(request.query)):
+        try:
+            requestdata = _parse_json_body(await request.json())
+        except JSONDecodeError as error:
+            LOGGER.error("Error parsing JSON body: %s", error)
+            return web.Response(
+                text="Invalid JSON",
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
     try:
-        data = WEBHOOK_SCHEMA(dict(request.query))
+        data = WEBHOOK_SCHEMA(requestdata)
     except vol.MultipleInvalid as error:
-        return web.Response(text=error.error_message, status=HTTP_UNPROCESSABLE_ENTITY)
+        LOGGER.warning(humanize_error(requestdata, error))
+        return web.Response(
+            text=error.error_message,
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
 
     attrs = {
         ATTR_ALTITUDE: data.get(ATTR_ALTITUDE),
@@ -84,28 +117,25 @@ async def handle_webhook(hass, webhook_id, request):
         attrs,
     )
 
-    return web.Response(text=f"Setting location for {device}", status=HTTP_OK)
+    return web.Response(text=f"Setting location for {device}")
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Configure based on config entry."""
-    hass.components.webhook.async_register(
-        DOMAIN, "Traccar", entry.data[CONF_WEBHOOK_ID], handle_webhook
+    hass.data.setdefault(DOMAIN, {"devices": set(), "unsub_device_tracker": {}})
+    webhook.async_register(
+        hass, DOMAIN, "Traccar", entry.data[CONF_WEBHOOK_ID], handle_webhook
     )
 
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, DEVICE_TRACKER)
-    )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    hass.components.webhook.async_unregister(entry.data[CONF_WEBHOOK_ID])
+    webhook.async_unregister(hass, entry.data[CONF_WEBHOOK_ID])
     hass.data[DOMAIN]["unsub_device_tracker"].pop(entry.entry_id)()
-    await hass.config_entries.async_forward_entry_unload(entry, DEVICE_TRACKER)
-    return True
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
-# pylint: disable=invalid-name
 async_remove_entry = config_entry_flow.webhook_async_remove_entry

@@ -1,110 +1,166 @@
 """Axis binary sensor platform tests."""
 
-from unittest.mock import Mock
+from unittest.mock import patch
 
-from homeassistant import config_entries
-from homeassistant.components import axis
-from homeassistant.setup import async_setup_component
+import pytest
+from syrupy.assertion import SnapshotAssertion
 
-import homeassistant.components.binary_sensor as binary_sensor
+from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-EVENTS = [
-    {
-        "operation": "Initialized",
-        "topic": "tns1:Device/tnsaxis:Sensor/PIR",
-        "source": "sensor",
-        "source_idx": "0",
-        "type": "state",
-        "value": "0",
-    },
-    {
-        "operation": "Initialized",
-        "topic": "tnsaxis:CameraApplicationPlatform/VMD/Camera1Profile1",
-        "type": "active",
-        "value": "1",
-    },
-]
+from .conftest import ConfigEntryFactoryType, RtspEventMock
 
-ENTRY_CONFIG = {
-    axis.CONF_DEVICE: {
-        axis.config_flow.CONF_HOST: "1.2.3.4",
-        axis.config_flow.CONF_USERNAME: "user",
-        axis.config_flow.CONF_PASSWORD: "pass",
-        axis.config_flow.CONF_PORT: 80,
-    },
-    axis.config_flow.CONF_MAC: "1234ABCD",
-    axis.config_flow.CONF_MODEL: "model",
-    axis.config_flow.CONF_NAME: "model 0",
-}
-
-ENTRY_OPTIONS = {
-    axis.CONF_CAMERA: False,
-    axis.CONF_EVENTS: True,
-    axis.CONF_TRIGGER_TIME: 0,
-}
+from tests.common import snapshot_platform
 
 
-async def setup_device(hass):
-    """Load the Axis binary sensor platform."""
-    from axis import AxisDevice
-
-    loop = Mock()
-
-    config_entry = config_entries.ConfigEntry(
-        1,
-        axis.DOMAIN,
-        "Mock Title",
-        ENTRY_CONFIG,
-        "test",
-        config_entries.CONN_CLASS_LOCAL_PUSH,
-        system_options={},
-        options=ENTRY_OPTIONS,
-    )
-    device = axis.AxisNetworkDevice(hass, config_entry)
-    device.api = AxisDevice(loop=loop, **config_entry.data[axis.CONF_DEVICE])
-    hass.data[axis.DOMAIN] = {device.serial: device}
-    device.api.enable_events(event_callback=device.async_event_callback)
-
-    await hass.config_entries.async_forward_entry_setup(config_entry, "binary_sensor")
-    # To flush out the service call to update the group
-    await hass.async_block_till_done()
-
-    return device
-
-
-async def test_platform_manually_configured(hass):
-    """Test that nothing happens when platform is manually configured."""
-    assert (
-        await async_setup_component(
-            hass, binary_sensor.DOMAIN, {"binary_sensor": {"platform": axis.DOMAIN}}
-        )
-        is True
-    )
-
-    assert axis.DOMAIN not in hass.data
-
-
-async def test_no_binary_sensors(hass):
-    """Test that no sensors in Axis results in no sensor entities."""
-    await setup_device(hass)
-
-    assert len(hass.states.async_all()) == 0
-
-
-async def test_binary_sensors(hass):
+@pytest.mark.parametrize(
+    "event",
+    [
+        (
+            {
+                "topic": "tns1:VideoSource/tnsaxis:DayNightVision",
+                "source_name": "VideoSourceConfigurationToken",
+                "source_idx": "1",
+                "data_type": "DayNight",
+                "data_value": "1",
+            }
+        ),
+        (
+            {
+                "topic": "tns1:AudioSource/tnsaxis:TriggerLevel",
+                "source_name": "channel",
+                "source_idx": "1",
+                "data_type": "Sound",
+                "data_value": "0",
+            }
+        ),
+        (
+            {
+                "topic": "tns1:Device/tnsaxis:IO/Port",
+                "data_type": "state",
+                "data_value": "0",
+                "operation": "Initialized",
+                "source_name": "port",
+                "source_idx": "0",
+            }
+        ),
+        (
+            {
+                "topic": "tns1:Device/tnsaxis:Sensor/PIR",
+                "data_type": "state",
+                "data_value": "0",
+                "source_name": "sensor",
+                "source_idx": "0",
+            }
+        ),
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/FenceGuard/Camera1Profile1",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/MotionGuard/Camera1Profile1",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/LoiteringGuard/Camera1Profile1",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/VMD/Camera1Profile1",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+        # Events with names generated from event ID and topic
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/VMD/Camera1Profile9",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+        (
+            {
+                "topic": "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario8",
+                "data_type": "active",
+                "data_value": "1",
+            }
+        ),
+    ],
+)
+async def test_binary_sensors(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+    config_entry_factory: ConfigEntryFactoryType,
+    mock_rtsp_event: RtspEventMock,
+    event: dict[str, str],
+) -> None:
     """Test that sensors are loaded properly."""
-    device = await setup_device(hass)
+    with patch("homeassistant.components.axis.PLATFORMS", [Platform.BINARY_SENSOR]):
+        config_entry = await config_entry_factory()
+    mock_rtsp_event(**event)
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
-    for event in EVENTS:
-        device.api.stream.event.manage_event(event)
-    await hass.async_block_till_done()
 
-    assert len(hass.states.async_all()) == 2
-
-    pir = hass.states.get("binary_sensor.model_0_pir_0")
-    assert pir.state == "off"
-    assert pir.name == "model 0 PIR 0"
-
-    vmd4 = hass.states.get("binary_sensor.model_0_vmd4_camera1profile1")
-    assert vmd4.state == "on"
-    assert vmd4.name == "model 0 VMD4 Camera1Profile1"
+@pytest.mark.parametrize(
+    "event",
+    [
+        # Event with unsupported topic
+        {
+            "topic": "tns1:PTZController/tnsaxis:PTZPresets/Channel_1",
+            "data_type": "on_preset",
+            "data_value": "1",
+            "source_name": "PresetToken",
+            "source_idx": "0",
+        },
+        # Event with unsupported source_idx
+        {
+            "topic": "tns1:Device/tnsaxis:IO/Port",
+            "data_type": "state",
+            "data_value": "0",
+            "operation": "Initialized",
+            "source_name": "port",
+            "source_idx": "-1",
+        },
+        # Event with unsupported ID in topic 'ANY'
+        {
+            "topic": "tnsaxis:CameraApplicationPlatform/VMD/Camera1ProfileANY",
+            "data_type": "active",
+            "data_value": "1",
+        },
+        {
+            "topic": "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1ScenarioANY",
+            "data_type": "active",
+            "data_value": "1",
+        },
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_unsupported_events(
+    hass: HomeAssistant,
+    mock_rtsp_event: RtspEventMock,
+    event: dict[str, str],
+) -> None:
+    """Validate nothing breaks with unsupported events."""
+    mock_rtsp_event(**event)
+    assert len(hass.states.async_entity_ids(BINARY_SENSOR_DOMAIN)) == 0

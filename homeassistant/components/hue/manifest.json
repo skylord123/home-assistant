@@ -1,23 +1,15 @@
 {
   "domain": "hue",
   "name": "Philips Hue",
+  "codeowners": ["@marcelveldt"],
   "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/hue",
-  "requirements": [
-    "aiohue==1.9.2"
-  ],
-  "ssdp": [
-    {
-      "manufacturer": "Royal Philips Electronics"
-    }
-  ],
   "homekit": {
-    "models": [
-      "BSB002"
-    ]
+    "models": ["BSB002"]
   },
-  "dependencies": [],
-  "codeowners": [
-    "@balloob"
-  ]
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["aiohue"],
+  "requirements": ["aiohue==4.8.0"],
+  "zeroconf": ["_hue._tcp.local."]
 }

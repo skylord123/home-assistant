@@ -1,49 +1,61 @@
 """The tests for the Home Assistant API component."""
-# pylint: disable=protected-access
-import asyncio
-import json
-from unittest.mock import patch
 
-from aiohttp import web
+import asyncio
+from http import HTTPStatus
+import json
+from typing import Any
+from unittest.mock import ANY, patch
+
+from aiohttp import ServerDisconnectedError, web
+from aiohttp.test_utils import TestClient
 import pytest
+from syrupy.assertion import SnapshotAssertion
 import voluptuous as vol
 
-from homeassistant import const
+from homeassistant import const, core as ha
+from homeassistant.auth.models import Credentials
 from homeassistant.bootstrap import DATA_LOGGING
-import homeassistant.core as ha
+from homeassistant.components.group import DOMAIN as GROUP_DOMAIN
+from homeassistant.components.logger import DOMAIN as LOGGER_DOMAIN
+from homeassistant.components.system_health import DOMAIN as SYSTEM_HEALTH_DOMAIN
+from homeassistant.core import HomeAssistant
+from homeassistant.loader import Integration
 from homeassistant.setup import async_setup_component
+from homeassistant.util.yaml.loader import JSON_TYPE
 
-from tests.common import async_mock_service
+from tests.common import CLIENT_ID, MockUser, async_mock_service
+from tests.typing import ClientSessionGenerator
 
 
 @pytest.fixture
-def mock_api_client(hass, hass_client):
-    """Start the Hass HTTP component and return admin API client."""
-    hass.loop.run_until_complete(async_setup_component(hass, "api", {}))
-    return hass.loop.run_until_complete(hass_client())
+async def mock_api_client(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> TestClient:
+    """Start the Home Assistant HTTP component and return admin API client."""
+    await async_setup_component(hass, "api", {})
+    return await hass_client()
 
 
-@asyncio.coroutine
-def test_api_list_state_entities(hass, mock_api_client):
+async def test_api_list_state_entities(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the debug interface allows us to list state entities."""
     hass.states.async_set("test.entity", "hello")
-    resp = yield from mock_api_client.get(const.URL_API_STATES)
-    assert resp.status == 200
-    json = yield from resp.json()
+    resp = await mock_api_client.get(const.URL_API_STATES)
+    assert resp.status == HTTPStatus.OK
+    json = await resp.json()
 
-    remote_data = [ha.State.from_dict(item) for item in json]
-    assert remote_data == hass.states.async_all()
+    remote_data = [ha.State.from_dict(item).as_dict() for item in json]
+    local_data = [state.as_dict() for state in hass.states.async_all()]
+    assert remote_data == local_data
 
 
-@asyncio.coroutine
-def test_api_get_state(hass, mock_api_client):
+async def test_api_get_state(hass: HomeAssistant, mock_api_client: TestClient) -> None:
     """Test if the debug interface allows us to get a state."""
     hass.states.async_set("hello.world", "nice", {"attr": 1})
-    resp = yield from mock_api_client.get(
-        const.URL_API_STATES_ENTITY.format("hello.world")
-    )
-    assert resp.status == 200
-    json = yield from resp.json()
+    resp = await mock_api_client.get("/api/states/hello.world")
+    assert resp.status == HTTPStatus.OK
+    json = await resp.json()
 
     data = ha.State.from_dict(json)
 
@@ -54,77 +66,117 @@ def test_api_get_state(hass, mock_api_client):
     assert data.attributes == state.attributes
 
 
-@asyncio.coroutine
-def test_api_get_non_existing_state(hass, mock_api_client):
+async def test_api_get_non_existing_state(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the debug interface allows us to get a state."""
-    resp = yield from mock_api_client.get(
-        const.URL_API_STATES_ENTITY.format("does_not_exist")
-    )
-    assert resp.status == 404
+    resp = await mock_api_client.get("/api/states/does_not_exist")
+    assert resp.status == HTTPStatus.NOT_FOUND
 
 
-@asyncio.coroutine
-def test_api_state_change(hass, mock_api_client):
+async def test_api_state_change(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if we can change the state of an entity that exists."""
     hass.states.async_set("test.test", "not_to_be_set")
 
-    yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test.test"),
-        json={"state": "debug_state_change2"},
+    await mock_api_client.post(
+        "/api/states/test.test", json={"state": "debug_state_change2"}
     )
 
     assert hass.states.get("test.test").state == "debug_state_change2"
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_state_change_of_non_existing_entity(hass, mock_api_client):
+async def test_api_state_change_of_non_existing_entity(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if changing a state of a non existing entity is possible."""
     new_state = "debug_state_change"
 
-    resp = yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test_entity.that_does_not_exist"),
-        json={"state": new_state},
+    resp = await mock_api_client.post(
+        "/api/states/test_entity.that_does_not_exist", json={"state": new_state}
     )
 
-    assert resp.status == 201
+    assert resp.status == HTTPStatus.CREATED
 
     assert hass.states.get("test_entity.that_does_not_exist").state == new_state
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_state_change_with_bad_data(hass, mock_api_client):
+async def test_api_state_change_with_bad_entity_id(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if API sends appropriate error if we omit state."""
-    resp = yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test_entity.that_does_not_exist"), json={}
+    resp = await mock_api_client.post(
+        "/api/states/bad.entity.id", json={"state": "new_state"}
     )
 
-    assert resp.status == 400
+    assert resp.status == HTTPStatus.BAD_REQUEST
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_state_change_to_zero_value(hass, mock_api_client):
+async def test_api_state_change_with_bad_state(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if API sends appropriate error if we omit state."""
+    resp = await mock_api_client.post(
+        "/api/states/test.test", json={"state": "x" * 256}
+    )
+
+    assert resp.status == HTTPStatus.BAD_REQUEST
+
+
+async def test_api_state_change_with_bad_data(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if API sends appropriate error if we omit state."""
+    resp = await mock_api_client.post(
+        "/api/states/test_entity.that_does_not_exist", json={}
+    )
+
+    assert resp.status == HTTPStatus.BAD_REQUEST
+
+
+async def test_api_state_change_with_invalid_json(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if API sends appropriate error if send invalid json data."""
+    resp = await mock_api_client.post("/api/states/test.test", data="{,}")
+
+    assert resp.status == HTTPStatus.BAD_REQUEST
+    assert await resp.json() == {"message": "Invalid JSON specified."}
+
+
+async def test_api_state_change_with_string_body(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if API sends appropriate error if we send a string instead of a JSON object."""
+    resp = await mock_api_client.post(
+        "/api/states/bad.entity.id", json='"{"state": "new_state"}"'
+    )
+
+    assert resp.status == HTTPStatus.BAD_REQUEST
+    assert await resp.json() == {"message": "State data should be a JSON object."}
+
+
+async def test_api_state_change_to_zero_value(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if changing a state to a zero value is possible."""
-    resp = yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test_entity.with_zero_state"),
-        json={"state": 0},
+    resp = await mock_api_client.post(
+        "/api/states/test_entity.with_zero_state", json={"state": 0}
     )
 
-    assert resp.status == 201
+    assert resp.status == HTTPStatus.CREATED
 
-    resp = yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test_entity.with_zero_state"),
-        json={"state": 0.0},
+    resp = await mock_api_client.post(
+        "/api/states/test_entity.with_zero_state", json={"state": 0.0}
     )
 
-    assert resp.status == 200
+    assert resp.status == HTTPStatus.OK
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_state_change_push(hass, mock_api_client):
+async def test_api_state_change_push(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if we can push a change the state of an entity."""
     hass.states.async_set("test.test", "not_to_be_set")
 
@@ -137,23 +189,20 @@ def test_api_state_change_push(hass, mock_api_client):
 
     hass.bus.async_listen(const.EVENT_STATE_CHANGED, event_listener)
 
-    yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test.test"), json={"state": "not_to_be_set"}
-    )
-    yield from hass.async_block_till_done()
+    await mock_api_client.post("/api/states/test.test", json={"state": "not_to_be_set"})
+    await hass.async_block_till_done()
     assert len(events) == 0
 
-    yield from mock_api_client.post(
-        const.URL_API_STATES_ENTITY.format("test.test"),
-        json={"state": "not_to_be_set", "force_update": True},
+    await mock_api_client.post(
+        "/api/states/test.test", json={"state": "not_to_be_set", "force_update": True}
     )
-    yield from hass.async_block_till_done()
+    await hass.async_block_till_done()
     assert len(events) == 1
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_fire_event_with_no_data(hass, mock_api_client):
+async def test_api_fire_event_with_no_data(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the API allows us to fire an event."""
     test_value = []
 
@@ -164,17 +213,15 @@ def test_api_fire_event_with_no_data(hass, mock_api_client):
 
     hass.bus.async_listen_once("test.event_no_data", listener)
 
-    yield from mock_api_client.post(
-        const.URL_API_EVENTS_EVENT.format("test.event_no_data")
-    )
-    yield from hass.async_block_till_done()
+    await mock_api_client.post("/api/events/test.event_no_data")
+    await hass.async_block_till_done()
 
     assert len(test_value) == 1
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_fire_event_with_data(hass, mock_api_client):
+async def test_api_fire_event_with_data(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the API allows us to fire an event."""
     test_value = []
 
@@ -189,18 +236,16 @@ def test_api_fire_event_with_data(hass, mock_api_client):
 
     hass.bus.async_listen_once("test_event_with_data", listener)
 
-    yield from mock_api_client.post(
-        const.URL_API_EVENTS_EVENT.format("test_event_with_data"), json={"test": 1}
-    )
+    await mock_api_client.post("/api/events/test_event_with_data", json={"test": 1})
 
-    yield from hass.async_block_till_done()
+    await hass.async_block_till_done()
 
     assert len(test_value) == 1
 
 
-# pylint: disable=invalid-name
-@asyncio.coroutine
-def test_api_fire_event_with_invalid_json(hass, mock_api_client):
+async def test_api_fire_event_with_invalid_json(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the API allows us to fire an event."""
     test_value = []
 
@@ -211,54 +256,61 @@ def test_api_fire_event_with_invalid_json(hass, mock_api_client):
 
     hass.bus.async_listen_once("test_event_bad_data", listener)
 
-    resp = yield from mock_api_client.post(
-        const.URL_API_EVENTS_EVENT.format("test_event_bad_data"),
-        data=json.dumps("not an object"),
+    resp = await mock_api_client.post(
+        "/api/events/test_event_bad_data", data=json.dumps("not an object")
     )
 
-    yield from hass.async_block_till_done()
+    await hass.async_block_till_done()
 
-    assert resp.status == 400
+    assert resp.status == HTTPStatus.BAD_REQUEST
     assert len(test_value) == 0
 
     # Try now with valid but unusable JSON
-    resp = yield from mock_api_client.post(
-        const.URL_API_EVENTS_EVENT.format("test_event_bad_data"),
-        data=json.dumps([1, 2, 3]),
+    resp = await mock_api_client.post(
+        "/api/events/test_event_bad_data", data=json.dumps([1, 2, 3])
     )
 
-    yield from hass.async_block_till_done()
+    await hass.async_block_till_done()
 
-    assert resp.status == 400
+    assert resp.status == HTTPStatus.BAD_REQUEST
     assert len(test_value) == 0
 
 
-@asyncio.coroutine
-def test_api_get_config(hass, mock_api_client):
+async def test_api_get_config(hass: HomeAssistant, mock_api_client: TestClient) -> None:
     """Test the return of the configuration."""
-    resp = yield from mock_api_client.get(const.URL_API_CONFIG)
-    result = yield from resp.json()
-    if "components" in result:
-        result["components"] = set(result["components"])
-    if "whitelist_external_dirs" in result:
-        result["whitelist_external_dirs"] = set(result["whitelist_external_dirs"])
+    resp = await mock_api_client.get(const.URL_API_CONFIG)
+    result = await resp.json()
+    ignore_order_keys = (
+        "components",
+        "allowlist_external_dirs",
+        "whitelist_external_dirs",
+        "allowlist_external_urls",
+    )
+    config = hass.config.as_dict()
 
-    assert hass.config.as_dict() == result
+    for key in ignore_order_keys:
+        if key in result:
+            result[key] = set(result[key])
+            config[key] = set(config[key])
+
+    assert result == config
 
 
-@asyncio.coroutine
-def test_api_get_components(hass, mock_api_client):
+async def test_api_get_components(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test the return of the components."""
-    resp = yield from mock_api_client.get(const.URL_API_COMPONENTS)
-    result = yield from resp.json()
+    resp = await mock_api_client.get(const.URL_API_COMPONENTS)
+    result = await resp.json()
     assert set(result) == hass.config.components
 
 
-@asyncio.coroutine
-def test_api_get_event_listeners(hass, mock_api_client):
+async def test_api_get_event_listeners(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if we can get the list of events being listened for."""
-    resp = yield from mock_api_client.get(const.URL_API_EVENTS)
-    data = yield from resp.json()
+    resp = await mock_api_client.get(const.URL_API_EVENTS)
+    data = await resp.json()
 
     local = hass.bus.async_listeners()
 
@@ -268,21 +320,74 @@ def test_api_get_event_listeners(hass, mock_api_client):
     assert len(local) == 0
 
 
-@asyncio.coroutine
-def test_api_get_services(hass, mock_api_client):
+async def test_api_get_services(
+    hass: HomeAssistant,
+    mock_api_client: TestClient,
+    snapshot: SnapshotAssertion,
+) -> None:
     """Test if we can get a dict describing current services."""
-    resp = yield from mock_api_client.get(const.URL_API_SERVICES)
-    data = yield from resp.json()
-    local_services = hass.services.async_services()
+    # Set up an integration that has services
+    assert await async_setup_component(hass, GROUP_DOMAIN, {GROUP_DOMAIN: {}})
 
-    for serv_domain in data:
-        local = local_services.pop(serv_domain["domain"])
+    # Set up an integration that has no services
+    assert await async_setup_component(hass, SYSTEM_HEALTH_DOMAIN, {})
 
-        assert serv_domain["services"] == local
+    resp = await mock_api_client.get(const.URL_API_SERVICES)
+    data = await resp.json()
+
+    assert data == snapshot
+
+    # Set up an integration with legacy translations in services.yaml
+    def _load_services_file(integration: Integration) -> JSON_TYPE:
+        return {
+            "set_default_level": {
+                "description": "Translated description",
+                "fields": {
+                    "level": {
+                        "description": "Field description",
+                        "example": "Field example",
+                        "name": "Field name",
+                        "selector": {
+                            "select": {
+                                "options": [
+                                    "debug",
+                                    "info",
+                                    "warning",
+                                    "error",
+                                    "fatal",
+                                    "critical",
+                                ],
+                                "translation_key": "level",
+                            }
+                        },
+                    }
+                },
+                "name": "Translated name",
+            },
+            "set_level": None,
+        }
+
+    await async_setup_component(hass, LOGGER_DOMAIN, {LOGGER_DOMAIN: {}})
+    await hass.async_block_till_done()
+
+    with (
+        patch(
+            "homeassistant.helpers.service._load_services_file",
+            side_effect=_load_services_file,
+        ),
+    ):
+        resp = await mock_api_client.get(const.URL_API_SERVICES)
+
+    data2 = await resp.json()
+
+    assert data2 == [*data, {"domain": LOGGER_DOMAIN, "services": ANY}]
+
+    assert data2[-1] == snapshot
 
 
-@asyncio.coroutine
-def test_api_call_service_no_data(hass, mock_api_client):
+async def test_api_call_service_no_data(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the API allows us to call a service."""
     test_value = []
 
@@ -293,17 +398,15 @@ def test_api_call_service_no_data(hass, mock_api_client):
 
     hass.services.async_register("test_domain", "test_service", listener)
 
-    yield from mock_api_client.post(
-        const.URL_API_SERVICES_SERVICE.format("test_domain", "test_service")
-    )
-    yield from hass.async_block_till_done()
+    await mock_api_client.post("/api/services/test_domain/test_service")
+    await hass.async_block_till_done()
     assert len(test_value) == 1
 
 
-@asyncio.coroutine
-def test_api_call_service_with_data(hass, mock_api_client):
+async def test_api_call_service_with_data(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test if the API allows us to call a service."""
-    test_value = []
 
     @ha.callback
     def listener(service_call):
@@ -311,93 +414,270 @@ def test_api_call_service_with_data(hass, mock_api_client):
 
         Also test if our data came through.
         """
-        if "test" in service_call.data:
-            test_value.append(1)
+        hass.states.async_set(
+            "test.data",
+            "on",
+            {"data": service_call.data["test"]},
+            context=service_call.context,
+        )
 
     hass.services.async_register("test_domain", "test_service", listener)
 
-    yield from mock_api_client.post(
-        const.URL_API_SERVICES_SERVICE.format("test_domain", "test_service"),
-        json={"test": 1},
+    resp = await mock_api_client.post(
+        "/api/services/test_domain/test_service", json={"test": 1}
+    )
+    data = await resp.json()
+    assert len(data) == 1
+    state = data[0]
+    assert state["entity_id"] == "test.data"
+    assert state["state"] == "on"
+    assert state["attributes"] == {"data": 1}
+
+
+SERVICE_DICT = {"changed_states": [], "service_response": {"foo": "bar"}}
+RESP_REQUIRED = {
+    "message": (
+        "Service call requires responses but caller did not ask for "
+        "responses. Add ?return_response to query parameters."
+    )
+}
+RESP_UNSUPPORTED = {
+    "message": "Service does not support responses. Remove return_response from request."
+}
+
+
+@pytest.mark.parametrize(
+    (
+        "supports_response",
+        "requested_response",
+        "expected_number_of_service_calls",
+        "expected_status",
+        "expected_response",
+    ),
+    [
+        (ha.SupportsResponse.ONLY, True, 1, HTTPStatus.OK, SERVICE_DICT),
+        (ha.SupportsResponse.ONLY, False, 0, HTTPStatus.BAD_REQUEST, RESP_REQUIRED),
+        (ha.SupportsResponse.OPTIONAL, True, 1, HTTPStatus.OK, SERVICE_DICT),
+        (ha.SupportsResponse.OPTIONAL, False, 1, HTTPStatus.OK, []),
+        (ha.SupportsResponse.NONE, True, 0, HTTPStatus.BAD_REQUEST, RESP_UNSUPPORTED),
+        (ha.SupportsResponse.NONE, False, 1, HTTPStatus.OK, []),
+    ],
+)
+async def test_api_call_service_returns_response_requested_response(
+    hass: HomeAssistant,
+    mock_api_client: TestClient,
+    supports_response: ha.SupportsResponse,
+    requested_response: bool,
+    expected_number_of_service_calls: int,
+    expected_status: int,
+    expected_response: Any,
+) -> None:
+    """Test if the API allows us to call a service."""
+    test_value = []
+
+    @ha.callback
+    def listener(service_call):
+        """Record that our service got called."""
+        test_value.append(1)
+        return {"foo": "bar"}
+
+    hass.services.async_register(
+        "test_domain", "test_service", listener, supports_response=supports_response
     )
 
-    yield from hass.async_block_till_done()
+    resp = await mock_api_client.post(
+        "/api/services/test_domain/test_service"
+        + ("?return_response" if requested_response else "")
+    )
+    assert resp.status == expected_status
+    await hass.async_block_till_done()
+    assert len(test_value) == expected_number_of_service_calls
+    assert await resp.json() == expected_response
+
+
+async def test_api_call_service_client_closed(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test that services keep running if client is closed."""
+    test_value = []
+
+    fut = hass.loop.create_future()
+    service_call_started = asyncio.Event()
+
+    async def listener(service_call):
+        """Wait and return after mock_api_client.post finishes."""
+        service_call_started.set()
+        value = await fut
+        test_value.append(value)
+
+    hass.services.async_register("test_domain", "test_service", listener)
+
+    api_task = hass.async_create_task(
+        mock_api_client.post("/api/services/test_domain/test_service")
+    )
+
+    await service_call_started.wait()
+
+    assert len(test_value) == 0
+
+    await mock_api_client.close()
+
+    assert len(test_value) == 0
+    assert api_task.done()
+
+    with pytest.raises(ServerDisconnectedError):
+        await api_task
+
+    fut.set_result(1)
+    await hass.async_block_till_done()
+
     assert len(test_value) == 1
+    assert test_value[0] == 1
 
 
-@asyncio.coroutine
-def test_api_template(hass, mock_api_client):
+async def test_api_template(hass: HomeAssistant, mock_api_client: TestClient) -> None:
     """Test the template API."""
     hass.states.async_set("sensor.temperature", 10)
 
-    resp = yield from mock_api_client.post(
+    resp = await mock_api_client.post(
         const.URL_API_TEMPLATE,
         json={"template": "{{ states.sensor.temperature.state }}"},
     )
 
-    body = yield from resp.text()
+    body = await resp.text()
 
     assert body == "10"
 
+    hass.states.async_set("sensor.temperature", 20)
+    resp = await mock_api_client.post(
+        const.URL_API_TEMPLATE,
+        json={"template": "{{ states.sensor.temperature.state }}"},
+    )
 
-@asyncio.coroutine
-def test_api_template_error(hass, mock_api_client):
+    body = await resp.text()
+
+    assert body == "20"
+
+    hass.states.async_remove("sensor.temperature")
+    resp = await mock_api_client.post(
+        const.URL_API_TEMPLATE,
+        json={"template": "{{ states.sensor.temperature.state }}"},
+    )
+
+    body = await resp.text()
+
+    assert body == ""
+
+
+async def test_api_template_cached(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test the template API uses the cache."""
+    hass.states.async_set("sensor.temperature", 30)
+
+    resp = await mock_api_client.post(
+        const.URL_API_TEMPLATE,
+        json={"template": "{{ states.sensor.temperature.state }}"},
+    )
+
+    body = await resp.text()
+
+    assert body == "30"
+
+    hass.states.async_set("sensor.temperature", 40)
+    resp = await mock_api_client.post(
+        const.URL_API_TEMPLATE,
+        json={"template": "{{ states.sensor.temperature.state }}"},
+    )
+
+    body = await resp.text()
+
+    assert body == "40"
+
+
+async def test_api_template_error(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test the template API."""
     hass.states.async_set("sensor.temperature", 10)
 
-    resp = yield from mock_api_client.post(
+    resp = await mock_api_client.post(
         const.URL_API_TEMPLATE, json={"template": "{{ states.sensor.temperature.state"}
     )
 
-    assert resp.status == 400
+    assert resp.status == HTTPStatus.BAD_REQUEST
 
 
-@asyncio.coroutine
-def test_stream(hass, mock_api_client):
+async def test_api_template_with_invalid_json(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if API sends appropriate error if send invalid json data."""
+    resp = await mock_api_client.post(const.URL_API_TEMPLATE, data="{,}")
+
+    assert resp.status == HTTPStatus.BAD_REQUEST
+    assert await resp.json() == {"message": "Invalid JSON specified."}
+
+
+async def test_api_template_error_with_string_body(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test that the API returns an appropriate error when a string is sent in the body."""
+    hass.states.async_set("sensor.temperature", 10)
+
+    resp = await mock_api_client.post(
+        const.URL_API_TEMPLATE,
+        json='"{"template": "{{ states.sensor.temperature.state"}"',
+    )
+
+    assert resp.status == HTTPStatus.BAD_REQUEST
+    assert await resp.json() == {"message": "Template data should be a JSON object."}
+
+
+async def test_stream(hass: HomeAssistant, mock_api_client: TestClient) -> None:
     """Test the stream."""
     listen_count = _listen_count(hass)
 
-    resp = yield from mock_api_client.get(const.URL_API_STREAM)
-    assert resp.status == 200
-    assert listen_count + 1 == _listen_count(hass)
+    async with mock_api_client.get(const.URL_API_STREAM) as resp:
+        assert resp.status == HTTPStatus.OK
+        assert listen_count + 1 == _listen_count(hass)
 
-    hass.bus.async_fire("test_event")
+        hass.bus.async_fire("test_event")
 
-    data = yield from _stream_next_event(resp.content)
+        data = await _stream_next_event(resp.content)
 
-    assert data["event_type"] == "test_event"
+        assert data["event_type"] == "test_event"
 
 
-@asyncio.coroutine
-def test_stream_with_restricted(hass, mock_api_client):
+async def test_stream_with_restricted(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
     """Test the stream with restrictions."""
     listen_count = _listen_count(hass)
 
-    resp = yield from mock_api_client.get(
-        "{}?restrict=test_event1,test_event3".format(const.URL_API_STREAM)
-    )
-    assert resp.status == 200
-    assert listen_count + 1 == _listen_count(hass)
+    async with mock_api_client.get(
+        f"{const.URL_API_STREAM}?restrict=test_event1,test_event3"
+    ) as resp:
+        assert resp.status == HTTPStatus.OK
+        assert listen_count + 1 == _listen_count(hass)
 
-    hass.bus.async_fire("test_event1")
-    data = yield from _stream_next_event(resp.content)
-    assert data["event_type"] == "test_event1"
+        hass.bus.async_fire("test_event1")
+        data = await _stream_next_event(resp.content)
+        assert data["event_type"] == "test_event1"
 
-    hass.bus.async_fire("test_event2")
-    hass.bus.async_fire("test_event3")
-    data = yield from _stream_next_event(resp.content)
-    assert data["event_type"] == "test_event3"
+        hass.bus.async_fire("test_event2")
+        hass.bus.async_fire("test_event3")
+        data = await _stream_next_event(resp.content)
+        assert data["event_type"] == "test_event3"
 
 
-@asyncio.coroutine
-def _stream_next_event(stream):
+async def _stream_next_event(stream):
     """Read the stream for next event while ignoring ping."""
     while True:
         last_new_line = False
         data = b""
 
         while True:
-            dat = yield from stream.read(1)
+            dat = await stream.read(1)
             if dat == b"\n" and last_new_line:
                 break
             data += dat
@@ -410,44 +690,51 @@ def _stream_next_event(stream):
     return json.loads(conv)
 
 
-def _listen_count(hass):
+def _listen_count(hass: HomeAssistant) -> int:
     """Return number of event listeners."""
     return sum(hass.bus.async_listeners().values())
 
 
-async def test_api_error_log(hass, aiohttp_client, hass_access_token, hass_admin_user):
+async def test_api_error_log(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_access_token: str,
+    hass_admin_user: MockUser,
+) -> None:
     """Test if we can fetch the error log."""
     hass.data[DATA_LOGGING] = "/some/path"
     await async_setup_component(hass, "api", {})
-    client = await aiohttp_client(hass.http.app)
+    client = await hass_client_no_auth()
 
     resp = await client.get(const.URL_API_ERROR_LOG)
     # Verify auth required
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
     with patch(
-        "aiohttp.web.FileResponse", return_value=web.Response(status=200, text="Hello")
+        "aiohttp.web.FileResponse", return_value=web.Response(text="Hello")
     ) as mock_file:
         resp = await client.get(
             const.URL_API_ERROR_LOG,
-            headers={"Authorization": "Bearer {}".format(hass_access_token)},
+            headers={"Authorization": f"Bearer {hass_access_token}"},
         )
 
     assert len(mock_file.mock_calls) == 1
     assert mock_file.mock_calls[0][1][0] == hass.data[DATA_LOGGING]
-    assert resp.status == 200
+    assert resp.status == HTTPStatus.OK
     assert await resp.text() == "Hello"
 
     # Verify we require admin user
     hass_admin_user.groups = []
     resp = await client.get(
         const.URL_API_ERROR_LOG,
-        headers={"Authorization": "Bearer {}".format(hass_access_token)},
+        headers={"Authorization": f"Bearer {hass_access_token}"},
     )
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_api_fire_event_context(hass, mock_api_client, hass_access_token):
+async def test_api_fire_event_context(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_access_token: str
+) -> None:
     """Test if the API sets right context if we fire an event."""
     test_value = []
 
@@ -459,124 +746,165 @@ async def test_api_fire_event_context(hass, mock_api_client, hass_access_token):
     hass.bus.async_listen("test.event", listener)
 
     await mock_api_client.post(
-        const.URL_API_EVENTS_EVENT.format("test.event"),
-        headers={"authorization": "Bearer {}".format(hass_access_token)},
+        "/api/events/test.event",
+        headers={"authorization": f"Bearer {hass_access_token}"},
     )
     await hass.async_block_till_done()
 
-    refresh_token = await hass.auth.async_validate_access_token(hass_access_token)
+    refresh_token = hass.auth.async_validate_access_token(hass_access_token)
 
     assert len(test_value) == 1
     assert test_value[0].context.user_id == refresh_token.user.id
 
 
-async def test_api_call_service_context(hass, mock_api_client, hass_access_token):
+async def test_api_call_service_context(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_access_token: str
+) -> None:
     """Test if the API sets right context if we call a service."""
     calls = async_mock_service(hass, "test_domain", "test_service")
 
     await mock_api_client.post(
         "/api/services/test_domain/test_service",
-        headers={"authorization": "Bearer {}".format(hass_access_token)},
+        headers={"authorization": f"Bearer {hass_access_token}"},
     )
     await hass.async_block_till_done()
 
-    refresh_token = await hass.auth.async_validate_access_token(hass_access_token)
+    refresh_token = hass.auth.async_validate_access_token(hass_access_token)
 
     assert len(calls) == 1
     assert calls[0].context.user_id == refresh_token.user.id
 
 
-async def test_api_set_state_context(hass, mock_api_client, hass_access_token):
+async def test_api_set_state_context(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_access_token: str
+) -> None:
     """Test if the API sets right context if we set state."""
     await mock_api_client.post(
         "/api/states/light.kitchen",
         json={"state": "on"},
-        headers={"authorization": "Bearer {}".format(hass_access_token)},
+        headers={"authorization": f"Bearer {hass_access_token}"},
     )
 
-    refresh_token = await hass.auth.async_validate_access_token(hass_access_token)
+    refresh_token = hass.auth.async_validate_access_token(hass_access_token)
 
     state = hass.states.get("light.kitchen")
     assert state.context.user_id == refresh_token.user.id
 
 
-async def test_event_stream_requires_admin(hass, mock_api_client, hass_admin_user):
+async def test_event_stream_requires_admin(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
     """Test user needs to be admin to access event stream."""
     hass_admin_user.groups = []
     resp = await mock_api_client.get("/api/stream")
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_states_view_filters(hass, mock_api_client, hass_admin_user):
+async def test_states(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
+    """Test fetching all states as admin."""
+    hass.states.async_set("test.entity", "hello")
+    hass.states.async_set("test.entity2", "hello")
+    resp = await mock_api_client.get(const.URL_API_STATES)
+    assert resp.status == HTTPStatus.OK
+    json = await resp.json()
+    assert len(json) == 2
+    assert json[0]["entity_id"] == "test.entity"
+    assert json[1]["entity_id"] == "test.entity2"
+
+
+async def test_states_view_filters(
+    hass: HomeAssistant,
+    hass_read_only_user: MockUser,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test filtering only visible states."""
-    hass_admin_user.mock_policy({"entities": {"entity_ids": {"test.entity": True}}})
+    assert not hass_read_only_user.is_admin
+    hass_read_only_user.mock_policy({"entities": {"entity_ids": {"test.entity": True}}})
+    await async_setup_component(hass, "api", {})
+    read_only_user_credential = Credentials(
+        id="mock-read-only-credential-id",
+        auth_provider_type="homeassistant",
+        auth_provider_id=None,
+        data={"username": "readonly"},
+        is_new=False,
+    )
+    await hass.auth.async_link_user(hass_read_only_user, read_only_user_credential)
+
+    refresh_token = await hass.auth.async_create_refresh_token(
+        hass_read_only_user, CLIENT_ID, credential=read_only_user_credential
+    )
+    token = hass.auth.async_create_access_token(refresh_token)
+    mock_api_client = await hass_client(token)
     hass.states.async_set("test.entity", "hello")
     hass.states.async_set("test.not_visible_entity", "invisible")
     resp = await mock_api_client.get(const.URL_API_STATES)
-    assert resp.status == 200
+    assert resp.status == HTTPStatus.OK
     json = await resp.json()
     assert len(json) == 1
     assert json[0]["entity_id"] == "test.entity"
 
 
-async def test_get_entity_state_read_perm(hass, mock_api_client, hass_admin_user):
+async def test_get_entity_state_read_perm(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
     """Test getting a state requires read permission."""
     hass_admin_user.mock_policy({})
+    hass_admin_user.groups = []
+    assert hass_admin_user.is_admin is False
     resp = await mock_api_client.get("/api/states/light.test")
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_post_entity_state_admin(hass, mock_api_client, hass_admin_user):
+async def test_post_entity_state_admin(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
     """Test updating state requires admin."""
     hass_admin_user.groups = []
     resp = await mock_api_client.post("/api/states/light.test")
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_delete_entity_state_admin(hass, mock_api_client, hass_admin_user):
+async def test_delete_entity_state_admin(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
     """Test deleting entity requires admin."""
     hass_admin_user.groups = []
     resp = await mock_api_client.delete("/api/states/light.test")
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_post_event_admin(hass, mock_api_client, hass_admin_user):
+async def test_post_event_admin(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
     """Test sending event requires admin."""
     hass_admin_user.groups = []
     resp = await mock_api_client.post("/api/events/state_changed")
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_rendering_template_admin(hass, mock_api_client, hass_admin_user):
+async def test_rendering_template_admin(
+    hass: HomeAssistant, mock_api_client: TestClient, hass_admin_user: MockUser
+) -> None:
     """Test rendering a template requires admin."""
     hass_admin_user.groups = []
     resp = await mock_api_client.post(const.URL_API_TEMPLATE)
-    assert resp.status == 401
+    assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_rendering_template_legacy_user(
-    hass, mock_api_client, aiohttp_client, legacy_auth
-):
-    """Test rendering a template with legacy API password."""
-    hass.states.async_set("sensor.temperature", 10)
-    client = await aiohttp_client(hass.http.app)
-    resp = await client.post(
-        const.URL_API_TEMPLATE,
-        json={"template": "{{ states.sensor.temperature.state }}"},
-    )
-    assert resp.status == 401
+async def test_api_call_service_not_found(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if the API fails 400 if unknown service."""
+    resp = await mock_api_client.post("/api/services/test_domain/test_service")
+    assert resp.status == HTTPStatus.BAD_REQUEST
 
 
-async def test_api_call_service_not_found(hass, mock_api_client):
-    """Test if the API failes 400 if unknown service."""
-    resp = await mock_api_client.post(
-        const.URL_API_SERVICES_SERVICE.format("test_domain", "test_service")
-    )
-    assert resp.status == 400
-
-
-async def test_api_call_service_bad_data(hass, mock_api_client):
-    """Test if the API failes 400 if unknown service."""
+async def test_api_call_service_bad_data(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """Test if the API fails 400 if unknown service."""
     test_value = []
 
     @ha.callback
@@ -589,7 +917,61 @@ async def test_api_call_service_bad_data(hass, mock_api_client):
     )
 
     resp = await mock_api_client.post(
-        const.URL_API_SERVICES_SERVICE.format("test_domain", "test_service"),
-        json={"hello": 5},
+        "/api/services/test_domain/test_service", json={"hello": 5}
     )
-    assert resp.status == 400
+    assert resp.status == HTTPStatus.BAD_REQUEST
+
+
+async def test_api_status(hass: HomeAssistant, mock_api_client: TestClient) -> None:
+    """Test getting the api status."""
+    resp = await mock_api_client.get("/api/")
+    assert resp.status == HTTPStatus.OK
+    json = await resp.json()
+    assert json["message"] == "API running."
+
+
+async def test_api_core_state(hass: HomeAssistant, mock_api_client: TestClient) -> None:
+    """Test getting core status."""
+    resp = await mock_api_client.get("/api/core/state")
+    assert resp.status == HTTPStatus.OK
+    json = await resp.json()
+    assert json == {
+        "state": "RUNNING",
+        "recorder_state": {"migration_in_progress": False, "migration_is_live": False},
+    }
+
+
+@pytest.mark.parametrize(
+    ("migration_in_progress", "migration_is_live"),
+    [
+        (False, False),
+        (False, True),
+        (True, False),
+        (True, True),
+    ],
+)
+async def test_api_core_state_recorder_migrating(
+    hass: HomeAssistant,
+    mock_api_client: TestClient,
+    migration_in_progress: bool,
+    migration_is_live: bool,
+) -> None:
+    """Test getting core status."""
+    with (
+        patch(
+            "homeassistant.helpers.recorder.async_migration_in_progress",
+            return_value=migration_in_progress,
+        ),
+        patch(
+            "homeassistant.helpers.recorder.async_migration_is_live",
+            return_value=migration_is_live,
+        ),
+    ):
+        resp = await mock_api_client.get("/api/core/state")
+    assert resp.status == HTTPStatus.OK
+    json = await resp.json()
+    expected_recorder_state = {
+        "migration_in_progress": migration_in_progress,
+        "migration_is_live": migration_is_live,
+    }
+    assert json == {"state": "RUNNING", "recorder_state": expected_recorder_state}

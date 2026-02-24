@@ -1,60 +1,164 @@
 """Support for Hikvision event stream events represented as binary sensors."""
+
+from __future__ import annotations
+
 import logging
-from datetime import timedelta
+from typing import Any
+
 import voluptuous as vol
 
-from homeassistant.helpers.event import track_point_in_utc_time
-from homeassistant.util.dt import utcnow
-from homeassistant.components.binary_sensor import BinarySensorDevice, PLATFORM_SCHEMA
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.binary_sensor import (
+    PLATFORM_SCHEMA as BINARY_SENSOR_PLATFORM_SCHEMA,
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
-    CONF_HOST,
-    CONF_PORT,
-    CONF_NAME,
-    CONF_USERNAME,
-    CONF_PASSWORD,
-    CONF_SSL,
-    EVENT_HOMEASSISTANT_STOP,
-    EVENT_HOMEASSISTANT_START,
     ATTR_LAST_TRIP_TIME,
     CONF_CUSTOMIZE,
+    CONF_DELAY,
+    CONF_HOST,
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_SSL,
+    CONF_USERNAME,
+    EntityCategory,
 )
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-_LOGGER = logging.getLogger(__name__)
+from . import HikvisionConfigEntry
+from .const import DEFAULT_PORT, DOMAIN
+from .entity import HikvisionEntity
 
 CONF_IGNORED = "ignored"
-CONF_DELAY = "delay"
 
-DEFAULT_PORT = 80
-DEFAULT_IGNORED = False
 DEFAULT_DELAY = 0
+DEFAULT_IGNORED = False
 
-ATTR_DELAY = "delay"
 
-DEVICE_CLASS_MAP = {
-    "Motion": "motion",
-    "Line Crossing": "motion",
-    "Field Detection": "motion",
-    "Video Loss": None,
-    "Tamper Detection": "motion",
-    "Shelter Alarm": None,
-    "Disk Full": None,
-    "Disk Error": None,
-    "Net Interface Broken": "connectivity",
-    "IP Conflict": "connectivity",
-    "Illegal Access": None,
-    "Video Mismatch": None,
-    "Bad Video": None,
-    "PIR Alarm": "motion",
-    "Face Detection": "motion",
-    "Scene Change Detection": "motion",
-    "I/O": None,
-    "Unattended Baggage": "motion",
-    "Attended Baggage": "motion",
-    "Recording Failure": None,
-    "Exiting Region": "motion",
-    "Entering Region": "motion",
+# Entity descriptions for known Hikvision event types
+# The key matches the sensor_type from pyhik (the friendly name from SENSOR_MAP)
+BINARY_SENSOR_DESCRIPTIONS: dict[str, BinarySensorEntityDescription] = {
+    "Motion": BinarySensorEntityDescription(
+        key="motion",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Line Crossing": BinarySensorEntityDescription(
+        key="line_crossing",
+        translation_key="line_crossing",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Field Detection": BinarySensorEntityDescription(
+        key="field_detection",
+        translation_key="field_detection",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Tamper Detection": BinarySensorEntityDescription(
+        key="tamper_detection",
+        device_class=BinarySensorDeviceClass.TAMPER,
+    ),
+    "Shelter Alarm": BinarySensorEntityDescription(
+        key="shelter_alarm",
+        translation_key="shelter_alarm",
+    ),
+    "Disk Full": BinarySensorEntityDescription(
+        key="disk_full",
+        translation_key="disk_full",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "Disk Error": BinarySensorEntityDescription(
+        key="disk_error",
+        translation_key="disk_error",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "Net Interface Broken": BinarySensorEntityDescription(
+        key="net_interface_broken",
+        translation_key="net_interface_broken",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "IP Conflict": BinarySensorEntityDescription(
+        key="ip_conflict",
+        translation_key="ip_conflict",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "Illegal Access": BinarySensorEntityDescription(
+        key="illegal_access",
+        translation_key="illegal_access",
+        device_class=BinarySensorDeviceClass.SAFETY,
+    ),
+    "Video Mismatch": BinarySensorEntityDescription(
+        key="video_mismatch",
+        translation_key="video_mismatch",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "Bad Video": BinarySensorEntityDescription(
+        key="bad_video",
+        translation_key="bad_video",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "PIR Alarm": BinarySensorEntityDescription(
+        key="pir_alarm",
+        translation_key="pir_alarm",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Face Detection": BinarySensorEntityDescription(
+        key="face_detection",
+        translation_key="face_detection",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Scene Change Detection": BinarySensorEntityDescription(
+        key="scene_change_detection",
+        translation_key="scene_change_detection",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "I/O": BinarySensorEntityDescription(
+        key="io",
+        translation_key="io",
+    ),
+    "Unattended Baggage": BinarySensorEntityDescription(
+        key="unattended_baggage",
+        translation_key="unattended_baggage",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Attended Baggage": BinarySensorEntityDescription(
+        key="attended_baggage",
+        translation_key="attended_baggage",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Recording Failure": BinarySensorEntityDescription(
+        key="recording_failure",
+        translation_key="recording_failure",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    "Exiting Region": BinarySensorEntityDescription(
+        key="exiting_region",
+        translation_key="exiting_region",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    "Entering Region": BinarySensorEntityDescription(
+        key="entering_region",
+        translation_key="entering_region",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
 }
+
+_LOGGER = logging.getLogger(__name__)
 
 CUSTOMIZE_SCHEMA = vol.Schema(
     {
@@ -63,7 +167,7 @@ CUSTOMIZE_SCHEMA = vol.Schema(
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = BINARY_SENSOR_PLATFORM_SCHEMA.extend(
     {
         vol.Optional(CONF_NAME): cv.string,
         vol.Required(CONF_HOST): cv.string,
@@ -77,218 +181,145 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
+PARALLEL_UPDATES = 0
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    """Set up the Hikvision binary sensor devices."""
-    name = config.get(CONF_NAME)
-    host = config.get(CONF_HOST)
-    port = config.get(CONF_PORT)
-    username = config.get(CONF_USERNAME)
-    password = config.get(CONF_PASSWORD)
 
-    customize = config.get(CONF_CUSTOMIZE)
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    """Set up the Hikvision binary sensor platform from YAML."""
+    # Trigger the import flow to migrate YAML config to config entry
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=config
+    )
 
-    if config.get(CONF_SSL):
-        protocol = "https"
-    else:
-        protocol = "http"
+    if (
+        result.get("type") is FlowResultType.ABORT
+        and result.get("reason") != "already_configured"
+    ):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"deprecated_yaml_import_issue_{result.get('reason')}",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="deprecated_yaml_import_issue",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": "Hikvision",
+            },
+        )
+        return
 
-    url = f"{protocol}://{host}"
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Hikvision",
+        },
+    )
 
-    data = HikvisionData(hass, url, port, name, username, password)
 
-    if data.sensors is None:
-        _LOGGER.error("Hikvision event stream has no data, unable to set up")
-        return False
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: HikvisionConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Hikvision binary sensors from a config entry."""
+    data = entry.runtime_data
+    camera = data.camera
 
-    entities = []
+    sensors = camera.current_event_states
+    if sensors is None or not sensors:
+        _LOGGER.warning(
+            "Hikvision %s %s has no sensors available. "
+            "Ensure event detection is enabled and configured on the device",
+            data.device_type,
+            data.device_name,
+        )
+        return
 
-    for sensor, channel_list in data.sensors.items():
-        for channel in channel_list:
-            # Build sensor name, then parse customize config.
-            if data.type == "NVR":
-                sensor_name = "{}_{}".format(sensor.replace(" ", "_"), channel[1])
-            else:
-                sensor_name = sensor.replace(" ", "_")
-
-            custom = customize.get(sensor_name.lower(), {})
-            ignore = custom.get(CONF_IGNORED)
-            delay = custom.get(CONF_DELAY)
-
-            _LOGGER.debug(
-                "Entity: %s - %s, Options - Ignore: %s, Delay: %s",
-                data.name,
-                sensor_name,
-                ignore,
-                delay,
+    # Log warnings for unknown sensor types and skip them
+    for sensor_type in sensors:
+        if sensor_type not in BINARY_SENSOR_DESCRIPTIONS:
+            _LOGGER.warning(
+                "Unknown Hikvision sensor type '%s', please report this at "
+                "https://github.com/home-assistant/core/issues",
+                sensor_type,
             )
-            if not ignore:
-                entities.append(
-                    HikvisionBinarySensor(hass, sensor, channel[1], data, delay)
-                )
 
-    add_entities(entities)
-
-
-class HikvisionData:
-    """Hikvision device event stream object."""
-
-    def __init__(self, hass, url, port, name, username, password):
-        """Initialize the data object."""
-        from pyhik.hikvision import HikCamera
-
-        self._url = url
-        self._port = port
-        self._name = name
-        self._username = username
-        self._password = password
-
-        # Establish camera
-        self.camdata = HikCamera(self._url, self._port, self._username, self._password)
-
-        if self._name is None:
-            self._name = self.camdata.get_name
-
-        hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, self.stop_hik)
-        hass.bus.listen_once(EVENT_HOMEASSISTANT_START, self.start_hik)
-
-    def stop_hik(self, event):
-        """Shutdown Hikvision subscriptions and subscription thread on exit."""
-        self.camdata.disconnect()
-
-    def start_hik(self, event):
-        """Start Hikvision event stream thread."""
-        self.camdata.start_stream()
-
-    @property
-    def sensors(self):
-        """Return list of available sensors and their states."""
-        return self.camdata.current_event_states
-
-    @property
-    def cam_id(self):
-        """Return device id."""
-        return self.camdata.get_id
-
-    @property
-    def name(self):
-        """Return device name."""
-        return self._name
-
-    @property
-    def type(self):
-        """Return device type."""
-        return self.camdata.get_type
-
-    def get_attributes(self, sensor, channel):
-        """Return attribute list for sensor/channel."""
-        return self.camdata.fetch_attributes(sensor, channel)
+    async_add_entities(
+        HikvisionBinarySensor(
+            entry=entry,
+            description=BINARY_SENSOR_DESCRIPTIONS[sensor_type],
+            sensor_type=sensor_type,
+            channel=channel_info[1],
+        )
+        for sensor_type, channel_list in sensors.items()
+        if sensor_type in BINARY_SENSOR_DESCRIPTIONS
+        for channel_info in channel_list
+    )
 
 
-class HikvisionBinarySensor(BinarySensorDevice):
+class HikvisionBinarySensor(HikvisionEntity, BinarySensorEntity):
     """Representation of a Hikvision binary sensor."""
 
-    def __init__(self, hass, sensor, channel, cam, delay):
-        """Initialize the binary_sensor."""
-        self._hass = hass
-        self._cam = cam
-        self._sensor = sensor
-        self._channel = channel
+    _attr_should_poll = False
 
-        if self._cam.type == "NVR":
-            self._name = f"{self._cam.name} {sensor} {channel}"
-        else:
-            self._name = f"{self._cam.name} {sensor}"
+    def __init__(
+        self,
+        entry: HikvisionConfigEntry,
+        description: BinarySensorEntityDescription,
+        sensor_type: str,
+        channel: int,
+    ) -> None:
+        """Initialize the binary sensor."""
+        super().__init__(entry, channel)
+        self.entity_description = description
+        self._sensor_type = sensor_type
 
-        self._id = f"{self._cam.cam_id}.{sensor}.{channel}"
+        # Build unique ID (includes sensor_type for uniqueness per sensor)
+        self._attr_unique_id = f"{self._data.device_id}_{sensor_type}_{channel}"
 
-        if delay is None:
-            self._delay = 0
-        else:
-            self._delay = delay
+        # Callback ID for pyhik
+        self._callback_id = f"{self._data.device_id}.{sensor_type}.{channel}"
 
-        self._timer = None
-
-        # Register callback function with pyHik
-        self._cam.camdata.add_update_callback(self._update_callback, self._id)
-
-    def _sensor_state(self):
-        """Extract sensor state."""
-        return self._cam.get_attributes(self._sensor, self._channel)[0]
-
-    def _sensor_last_update(self):
-        """Extract sensor last update time."""
-        return self._cam.get_attributes(self._sensor, self._channel)[3]
+    def _get_sensor_attributes(self) -> tuple[bool, Any, Any, Any]:
+        """Get sensor attributes from camera."""
+        return self._camera.fetch_attributes(self._sensor_type, self._channel)
 
     @property
-    def name(self):
-        """Return the name of the Hikvision sensor."""
-        return self._name
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return self._id
-
-    @property
-    def is_on(self):
+    def is_on(self) -> bool:
         """Return true if sensor is on."""
-        return self._sensor_state()
+        return self._get_sensor_attributes()[0]
 
     @property
-    def device_class(self):
-        """Return the class of this sensor, from DEVICE_CLASSES."""
-        try:
-            return DEVICE_CLASS_MAP[self._sensor]
-        except KeyError:
-            # Sensor must be unknown to us, add as generic
-            return None
-
-    @property
-    def should_poll(self):
-        """No polling needed."""
-        return False
-
-    @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
-        attr = {}
-        attr[ATTR_LAST_TRIP_TIME] = self._sensor_last_update()
+        attrs = self._get_sensor_attributes()
+        return {ATTR_LAST_TRIP_TIME: attrs[3]}
 
-        if self._delay != 0:
-            attr[ATTR_DELAY] = self._delay
+    async def async_added_to_hass(self) -> None:
+        """Register callback when entity is added."""
+        await super().async_added_to_hass()
 
-        return attr
+        # Register callback with pyhik
+        self._camera.add_update_callback(self._update_callback, self._callback_id)
 
-    def _update_callback(self, msg):
-        """Update the sensor's state, if needed."""
-        _LOGGER.debug("Callback signal from: %s", msg)
+    def _update_callback(self, msg: str) -> None:
+        """Update the sensor's state when callback is triggered.
 
-        if self._delay > 0 and not self.is_on:
-            # Set timer to wait until updating the state
-            def _delay_update(now):
-                """Timer callback for sensor update."""
-                _LOGGER.debug(
-                    "%s Called delayed (%ssec) update", self._name, self._delay
-                )
-                self.schedule_update_ha_state()
-                self._timer = None
-
-            if self._timer is not None:
-                self._timer()
-                self._timer = None
-
-            self._timer = track_point_in_utc_time(
-                self._hass, _delay_update, utcnow() + timedelta(seconds=self._delay)
-            )
-
-        elif self._delay > 0 and self.is_on:
-            # For delayed sensors kill any callbacks on true events and update
-            if self._timer is not None:
-                self._timer()
-                self._timer = None
-
-            self.schedule_update_ha_state()
-
-        else:
-            self.schedule_update_ha_state()
+        This is called from pyhik's event stream thread, so we use
+        schedule_update_ha_state which is thread-safe.
+        """
+        self.schedule_update_ha_state()

@@ -1,126 +1,91 @@
-"""Support for toggling Amcrest IP camera settings."""
-import logging
+"""Support for Amcrest Switches."""
 
-from amcrest import AmcrestError
+from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
+from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.const import CONF_NAME, CONF_SWITCHES
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import ToggleEntity
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .const import DATA_AMCREST, DEVICES, SERVICE_UPDATE
-from .helpers import log_update_error, service_signal
+from .const import DATA_AMCREST, DEVICES
 
-_LOGGER = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from . import AmcrestDevice
 
-MOTION_DETECTION = "motion_detection"
-MOTION_RECORDING = "motion_recording"
-# Switch types are defined like: Name, icon
-SWITCHES = {
-    MOTION_DETECTION: ["Motion Detection", "mdi:run-fast"],
-    MOTION_RECORDING: ["Motion Recording", "mdi:record-rec"],
-}
+PRIVACY_MODE_KEY = "privacy_mode"
+
+SWITCH_TYPES: tuple[SwitchEntityDescription, ...] = (
+    SwitchEntityDescription(
+        key=PRIVACY_MODE_KEY,
+        name="Privacy Mode",
+        icon="mdi:eye-off",
+    ),
+)
+
+SWITCH_KEYS: list[str] = [desc.key for desc in SWITCH_TYPES]
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the IP Amcrest camera switch platform."""
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    """Set up amcrest platform switches."""
     if discovery_info is None:
         return
 
     name = discovery_info[CONF_NAME]
     device = hass.data[DATA_AMCREST][DEVICES][name]
+    switches = discovery_info[CONF_SWITCHES]
     async_add_entities(
         [
-            AmcrestSwitch(name, device, setting)
-            for setting in discovery_info[CONF_SWITCHES]
+            AmcrestSwitch(name, device, description)
+            for description in SWITCH_TYPES
+            if description.key in switches
         ],
         True,
     )
 
 
-class AmcrestSwitch(ToggleEntity):
-    """Representation of an Amcrest IP camera switch."""
+class AmcrestSwitch(SwitchEntity):
+    """Representation of an Amcrest Camera Switch."""
 
-    def __init__(self, name, device, setting):
-        """Initialize the Amcrest switch."""
-        self._name = "{} {}".format(name, SWITCHES[setting][0])
-        self._signal_name = name
+    def __init__(
+        self,
+        name: str,
+        device: AmcrestDevice,
+        entity_description: SwitchEntityDescription,
+    ) -> None:
+        """Initialize switch."""
         self._api = device.api
-        self._setting = setting
-        self._state = False
-        self._icon = SWITCHES[setting][1]
-        self._unsub_dispatcher = None
+        self.entity_description = entity_description
+        self._attr_name = f"{name} {entity_description.name}"
 
     @property
-    def name(self):
-        """Return the name of the switch if any."""
-        return self._name
-
-    @property
-    def is_on(self):
-        """Return true if switch is on."""
-        return self._state
-
-    def turn_on(self, **kwargs):
-        """Turn setting on."""
-        if not self.available:
-            return
-        try:
-            if self._setting == MOTION_DETECTION:
-                self._api.motion_detection = "true"
-            elif self._setting == MOTION_RECORDING:
-                self._api.motion_recording = "true"
-        except AmcrestError as error:
-            log_update_error(_LOGGER, "turn on", self.name, "switch", error)
-
-    def turn_off(self, **kwargs):
-        """Turn setting off."""
-        if not self.available:
-            return
-        try:
-            if self._setting == MOTION_DETECTION:
-                self._api.motion_detection = "false"
-            elif self._setting == MOTION_RECORDING:
-                self._api.motion_recording = "false"
-        except AmcrestError as error:
-            log_update_error(_LOGGER, "turn off", self.name, "switch", error)
-
-    @property
-    def available(self):
+    def available(self) -> bool:
         """Return True if entity is available."""
         return self._api.available
 
-    def update(self):
-        """Update setting state."""
-        if not self.available:
-            return
-        _LOGGER.debug("Updating %s switch", self._name)
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the switch on."""
+        await self._async_turn_switch(True)
 
-        try:
-            if self._setting == MOTION_DETECTION:
-                detection = self._api.is_motion_detector_on()
-            elif self._setting == MOTION_RECORDING:
-                detection = self._api.is_record_on_motion_detection()
-            self._state = detection
-        except AmcrestError as error:
-            log_update_error(_LOGGER, "update", self.name, "switch", error)
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the switch off."""
+        await self._async_turn_switch(False)
 
-    @property
-    def icon(self):
-        """Return the icon for the switch."""
-        return self._icon
-
-    async def async_on_demand_update(self):
-        """Update state."""
-        self.async_schedule_update_ha_state(True)
-
-    async def async_added_to_hass(self):
-        """Subscribe to update signal."""
-        self._unsub_dispatcher = async_dispatcher_connect(
-            self.hass,
-            service_signal(SERVICE_UPDATE, self._signal_name),
-            self.async_on_demand_update,
+    async def _async_turn_switch(self, mode: bool) -> None:
+        """Set privacy mode."""
+        lower_str = str(mode).lower()
+        await self._api.async_command(
+            f"configManager.cgi?action=setConfig&LeLensMask[0].Enable={lower_str}"
         )
 
-    async def async_will_remove_from_hass(self):
-        """Disconnect from update signal."""
-        self._unsub_dispatcher()
+    async def async_update(self) -> None:
+        """Update switch."""
+        io_res = (await self._api.async_privacy_config()).splitlines()[0].split("=")[1]
+        self._attr_is_on = io_res == "true"

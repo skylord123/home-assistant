@@ -1,337 +1,285 @@
 """Component to make instant statistics about your history."""
+
+from __future__ import annotations
+
+from abc import abstractmethod
+from collections.abc import Callable, Mapping
 import datetime
-import logging
-import math
+from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.core import callback
-from homeassistant.components import history
-import homeassistant.helpers.config_validation as cv
-import homeassistant.util.dt as dt_util
-from homeassistant.components.sensor import PLATFORM_SCHEMA
+from homeassistant.components.sensor import (
+    CONF_STATE_CLASS,
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.const import (
-    CONF_NAME,
     CONF_ENTITY_ID,
+    CONF_NAME,
     CONF_STATE,
     CONF_TYPE,
-    EVENT_HOMEASSISTANT_START,
+    CONF_UNIQUE_ID,
+    PERCENTAGE,
+    UnitOfTime,
 )
-from homeassistant.exceptions import TemplateError
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_state_change
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import PlatformNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.device import async_entity_id_to_device
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
+from homeassistant.helpers.reload import async_setup_reload_service
+from homeassistant.helpers.template import Template
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
+from . import HistoryStatsConfigEntry
+from .const import (
+    CONF_DURATION,
+    CONF_END,
+    CONF_PERIOD_KEYS,
+    CONF_START,
+    CONF_TYPE_COUNT,
+    CONF_TYPE_KEYS,
+    CONF_TYPE_RATIO,
+    CONF_TYPE_TIME,
+    DEFAULT_NAME,
+    DOMAIN,
+    PLATFORMS,
+)
+from .coordinator import HistoryStatsUpdateCoordinator
+from .data import HistoryStats
+from .helpers import pretty_ratio
 
-DOMAIN = "history_stats"
-CONF_START = "start"
-CONF_END = "end"
-CONF_DURATION = "duration"
-CONF_PERIOD_KEYS = [CONF_START, CONF_END, CONF_DURATION]
-
-CONF_TYPE_TIME = "time"
-CONF_TYPE_RATIO = "ratio"
-CONF_TYPE_COUNT = "count"
-CONF_TYPE_KEYS = [CONF_TYPE_TIME, CONF_TYPE_RATIO, CONF_TYPE_COUNT]
-
-DEFAULT_NAME = "unnamed statistics"
-UNITS = {CONF_TYPE_TIME: "h", CONF_TYPE_RATIO: "%", CONF_TYPE_COUNT: ""}
+UNITS: dict[str, str] = {
+    CONF_TYPE_TIME: UnitOfTime.HOURS,
+    CONF_TYPE_RATIO: PERCENTAGE,
+    CONF_TYPE_COUNT: "",
+}
 ICON = "mdi:chart-line"
 
-ATTR_VALUE = "value"
 
-
-def exactly_two_period_keys(conf):
+def exactly_two_period_keys[_T: dict[str, Any]](conf: _T) -> _T:
     """Ensure exactly 2 of CONF_PERIOD_KEYS are provided."""
     if sum(param in conf for param in CONF_PERIOD_KEYS) != 2:
         raise vol.Invalid(
-            "You must provide exactly 2 of the following:" " start, end, duration"
+            "You must provide exactly 2 of the following: start, end, duration"
         )
     return conf
 
 
+def no_ratio_total[_T: dict[str, Any]](conf: _T) -> _T:
+    """Ensure state_class:total_increasing not used with type:ratio."""
+    if (
+        conf.get(CONF_TYPE) == CONF_TYPE_RATIO
+        and conf.get(CONF_STATE_CLASS) == SensorStateClass.TOTAL_INCREASING
+    ):
+        raise vol.Invalid("State class total_increasing not to be used with type ratio")
+    return conf
+
+
 PLATFORM_SCHEMA = vol.All(
-    PLATFORM_SCHEMA.extend(
+    SENSOR_PLATFORM_SCHEMA.extend(
         {
             vol.Required(CONF_ENTITY_ID): cv.entity_id,
-            vol.Required(CONF_STATE): cv.string,
+            vol.Required(CONF_STATE): vol.All(cv.ensure_list, [cv.string]),
             vol.Optional(CONF_START): cv.template,
             vol.Optional(CONF_END): cv.template,
             vol.Optional(CONF_DURATION): cv.time_period,
             vol.Optional(CONF_TYPE, default=CONF_TYPE_TIME): vol.In(CONF_TYPE_KEYS),
             vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+            vol.Optional(CONF_UNIQUE_ID): cv.string,
+            vol.Optional(
+                CONF_STATE_CLASS, default=SensorStateClass.MEASUREMENT
+            ): vol.In(
+                [None, SensorStateClass.MEASUREMENT, SensorStateClass.TOTAL_INCREASING]
+            ),
         }
     ),
     exactly_two_period_keys,
+    no_ratio_total,
 )
 
 
-# noinspection PyUnusedLocal
-def setup_platform(hass, config, add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the History Stats sensor."""
-    entity_id = config.get(CONF_ENTITY_ID)
-    entity_state = config.get(CONF_STATE)
-    start = config.get(CONF_START)
-    end = config.get(CONF_END)
-    duration = config.get(CONF_DURATION)
-    sensor_type = config.get(CONF_TYPE)
-    name = config.get(CONF_NAME)
+    await async_setup_reload_service(hass, DOMAIN, PLATFORMS)
 
-    for template in [start, end]:
-        if template is not None:
-            template.hass = hass
+    entity_id: str = config[CONF_ENTITY_ID]
+    entity_states: list[str] = config[CONF_STATE]
+    start: Template | None = config.get(CONF_START)
+    end: Template | None = config.get(CONF_END)
+    duration: datetime.timedelta | None = config.get(CONF_DURATION)
+    sensor_type: str = config[CONF_TYPE]
+    name: str = config[CONF_NAME]
+    unique_id: str | None = config.get(CONF_UNIQUE_ID)
+    state_class: SensorStateClass | None = config.get(
+        CONF_STATE_CLASS, SensorStateClass.MEASUREMENT
+    )
 
-    add_entities(
+    history_stats = HistoryStats(hass, entity_id, entity_states, start, end, duration)
+    coordinator = HistoryStatsUpdateCoordinator(hass, history_stats, None, name)
+    await coordinator.async_refresh()
+    if not coordinator.last_update_success:
+        raise PlatformNotReady from coordinator.last_exception
+    async_add_entities(
         [
             HistoryStatsSensor(
-                hass, entity_id, entity_state, start, end, duration, sensor_type, name
+                hass,
+                coordinator=coordinator,
+                sensor_type=sensor_type,
+                name=name,
+                unique_id=unique_id,
+                source_entity_id=entity_id,
+                state_class=state_class,
             )
         ]
     )
 
-    return True
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: HistoryStatsConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the History stats sensor entry."""
+
+    sensor_type: str = entry.options[CONF_TYPE]
+    coordinator = entry.runtime_data
+    entity_id: str = entry.options[CONF_ENTITY_ID]
+    state_class: SensorStateClass | None = entry.options.get(CONF_STATE_CLASS)
+    async_add_entities(
+        [
+            HistoryStatsSensor(
+                hass,
+                coordinator=coordinator,
+                sensor_type=sensor_type,
+                name=entry.title,
+                unique_id=entry.entry_id,
+                source_entity_id=entity_id,
+                state_class=state_class,
+            )
+        ]
+    )
 
 
-class HistoryStatsSensor(Entity):
-    """Representation of a HistoryStats sensor."""
+class HistoryStatsSensorBase(
+    CoordinatorEntity[HistoryStatsUpdateCoordinator], SensorEntity
+):
+    """Base class for a HistoryStats sensor."""
+
+    _attr_icon = ICON
 
     def __init__(
-        self, hass, entity_id, entity_state, start, end, duration, sensor_type, name
-    ):
+        self,
+        coordinator: HistoryStatsUpdateCoordinator,
+        name: str,
+    ) -> None:
+        """Initialize the HistoryStats sensor base class."""
+        super().__init__(coordinator)
+        self._attr_name = name
+
+    async def async_added_to_hass(self) -> None:
+        """Entity has been added to hass."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self.coordinator.async_setup_state_listener())
+
+    def _handle_coordinator_update(self) -> None:
+        """Set attrs from value and count."""
+        self._process_update()
+        super()._handle_coordinator_update()
+
+    @callback
+    @abstractmethod
+    def _process_update(self) -> None:
+        """Process an update from the coordinator."""
+
+
+class HistoryStatsSensor(HistoryStatsSensorBase):
+    """A HistoryStats sensor."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        *,
+        coordinator: HistoryStatsUpdateCoordinator,
+        sensor_type: str,
+        name: str,
+        unique_id: str | None,
+        source_entity_id: str,
+        state_class: SensorStateClass | None,
+    ) -> None:
         """Initialize the HistoryStats sensor."""
-        self._entity_id = entity_id
-        self._entity_state = entity_state
-        self._duration = duration
-        self._start = start
-        self._end = end
+        super().__init__(coordinator, name)
+        self._preview_callback: (
+            Callable[[Exception | None, str, Mapping[str, Any]], None] | None
+        ) = None
+        self._attr_native_unit_of_measurement = UNITS[sensor_type]
         self._type = sensor_type
-        self._name = name
-        self._unit_of_measurement = UNITS[sensor_type]
+        self._attr_state_class = state_class
+        self._attr_unique_id = unique_id
+        if source_entity_id:  # Guard against empty source_entity_id in preview mode
+            self.device_entry = async_entity_id_to_device(
+                hass,
+                source_entity_id,
+            )
+        self._process_update()
+        if self._type == CONF_TYPE_TIME:
+            self._attr_device_class = SensorDeviceClass.DURATION
+            self._attr_suggested_display_precision = 2
 
-        self._period = (datetime.datetime.now(), datetime.datetime.now())
-        self.value = None
-        self.count = None
-
-        @callback
-        def start_refresh(*args):
-            """Register state tracking."""
-
-            @callback
-            def force_refresh(*args):
-                """Force the component to refresh."""
-                self.async_schedule_update_ha_state(True)
-
-            force_refresh()
-            async_track_state_change(self.hass, self._entity_id, force_refresh)
-
-        # Delay first refresh to keep startup fast
-        hass.bus.listen_once(EVENT_HOMEASSISTANT_START, start_refresh)
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def state(self):
-        """Return the state of the sensor."""
-        if self.value is None or self.count is None:
-            return None
+    @callback
+    def _process_update(self) -> None:
+        """Process an update from the coordinator."""
+        state = self.coordinator.data
+        if state is None or state.seconds_matched is None:
+            self._attr_native_value = None
+            return
 
         if self._type == CONF_TYPE_TIME:
-            return round(self.value, 2)
+            value = state.seconds_matched / 3600
+            if self._attr_unique_id is None:
+                value = round(value, 2)
+            self._attr_native_value = value
+        elif self._type == CONF_TYPE_RATIO:
+            self._attr_native_value = pretty_ratio(state.seconds_matched, state.period)
+        elif self._type == CONF_TYPE_COUNT:
+            self._attr_native_value = state.match_count
 
-        if self._type == CONF_TYPE_RATIO:
-            return HistoryStatsHelper.pretty_ratio(self.value, self._period)
+        if self._preview_callback:
+            calculated_state = self._async_calculate_state()
+            self._preview_callback(
+                None, calculated_state.state, calculated_state.attributes
+            )
 
-        if self._type == CONF_TYPE_COUNT:
-            return self.count
+    async def async_start_preview(
+        self,
+        preview_callback: Callable[
+            [BaseException | None, str, Mapping[str, Any]], None
+        ],
+    ) -> CALLBACK_TYPE:
+        """Render a preview."""
 
-    @property
-    def unit_of_measurement(self):
-        """Return the unit the value is expressed in."""
-        return self._unit_of_measurement
-
-    @property
-    def should_poll(self):
-        """Return the polling state."""
-        return True
-
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes of the sensor."""
-        if self.value is None:
-            return {}
-
-        hsh = HistoryStatsHelper
-        return {ATTR_VALUE: hsh.pretty_duration(self.value)}
-
-    @property
-    def icon(self):
-        """Return the icon to use in the frontend, if any."""
-        return ICON
-
-    def update(self):
-        """Get the latest data and updates the states."""
-        # Get previous values of start and end
-        p_start, p_end = self._period
-
-        # Parse templates
-        self.update_period()
-        start, end = self._period
-
-        # Convert times to UTC
-        start = dt_util.as_utc(start)
-        end = dt_util.as_utc(end)
-        p_start = dt_util.as_utc(p_start)
-        p_end = dt_util.as_utc(p_end)
-        now = datetime.datetime.now()
-
-        # Compute integer timestamps
-        start_timestamp = math.floor(dt_util.as_timestamp(start))
-        end_timestamp = math.floor(dt_util.as_timestamp(end))
-        p_start_timestamp = math.floor(dt_util.as_timestamp(p_start))
-        p_end_timestamp = math.floor(dt_util.as_timestamp(p_end))
-        now_timestamp = math.floor(dt_util.as_timestamp(now))
-
-        # If period has not changed and current time after the period end...
-        if (
-            start_timestamp == p_start_timestamp
-            and end_timestamp == p_end_timestamp
-            and end_timestamp <= now_timestamp
-        ):
-            # Don't compute anything as the value cannot have changed
-            return
-
-        # Get history between start and end
-        history_list = history.state_changes_during_period(
-            self.hass, start, end, str(self._entity_id)
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self._process_update, None)
         )
 
-        if self._entity_id not in history_list.keys():
-            return
+        self._preview_callback = preview_callback
+        calculated_state = self._async_calculate_state()
+        preview_callback(
+            self.coordinator.last_exception,
+            calculated_state.state,
+            calculated_state.attributes,
+        )
 
-        # Get the first state
-        last_state = history.get_state(self.hass, start, self._entity_id)
-        last_state = last_state is not None and last_state == self._entity_state
-        last_time = start_timestamp
-        elapsed = 0
-        count = 0
-
-        # Make calculations
-        for item in history_list.get(self._entity_id):
-            current_state = item.state == self._entity_state
-            current_time = item.last_changed.timestamp()
-
-            if last_state:
-                elapsed += current_time - last_time
-            if current_state and not last_state:
-                count += 1
-
-            last_state = current_state
-            last_time = current_time
-
-        # Count time elapsed between last history state and end of measure
-        if last_state:
-            measure_end = min(end_timestamp, now_timestamp)
-            elapsed += measure_end - last_time
-
-        # Save value in hours
-        self.value = elapsed / 3600
-
-        # Save counter
-        self.count = count
-
-    def update_period(self):
-        """Parse the templates and store a datetime tuple in _period."""
-        start = None
-        end = None
-
-        # Parse start
-        if self._start is not None:
-            try:
-                start_rendered = self._start.render()
-            except (TemplateError, TypeError) as ex:
-                HistoryStatsHelper.handle_template_exception(ex, "start")
-                return
-            start = dt_util.parse_datetime(start_rendered)
-            if start is None:
-                try:
-                    start = dt_util.as_local(
-                        dt_util.utc_from_timestamp(math.floor(float(start_rendered)))
-                    )
-                except ValueError:
-                    _LOGGER.error(
-                        "Parsing error: start must be a datetime" "or a timestamp"
-                    )
-                    return
-
-        # Parse end
-        if self._end is not None:
-            try:
-                end_rendered = self._end.render()
-            except (TemplateError, TypeError) as ex:
-                HistoryStatsHelper.handle_template_exception(ex, "end")
-                return
-            end = dt_util.parse_datetime(end_rendered)
-            if end is None:
-                try:
-                    end = dt_util.as_local(
-                        dt_util.utc_from_timestamp(math.floor(float(end_rendered)))
-                    )
-                except ValueError:
-                    _LOGGER.error(
-                        "Parsing error: end must be a datetime " "or a timestamp"
-                    )
-                    return
-
-        # Calculate start or end using the duration
-        if start is None:
-            start = end - self._duration
-        if end is None:
-            end = start + self._duration
-
-        if start > dt_util.now():
-            # History hasn't been written yet for this period
-            return
-        if dt_util.now() < end:
-            # No point in making stats of the future
-            end = dt_util.now()
-
-        self._period = start, end
-
-
-class HistoryStatsHelper:
-    """Static methods to make the HistoryStatsSensor code lighter."""
-
-    @staticmethod
-    def pretty_duration(hours):
-        """Format a duration in days, hours, minutes, seconds."""
-        seconds = int(3600 * hours)
-        days, seconds = divmod(seconds, 86400)
-        hours, seconds = divmod(seconds, 3600)
-        minutes, seconds = divmod(seconds, 60)
-        if days > 0:
-            return "%dd %dh %dm" % (days, hours, minutes)
-        if hours > 0:
-            return "%dh %dm" % (hours, minutes)
-        return "%dm" % minutes
-
-    @staticmethod
-    def pretty_ratio(value, period):
-        """Format the ratio of value / period duration."""
-        if len(period) != 2 or period[0] == period[1]:
-            return 0.0
-
-        ratio = 100 * 3600 * value / (period[1] - period[0]).total_seconds()
-        return round(ratio, 1)
-
-    @staticmethod
-    def handle_template_exception(ex, field):
-        """Log an error nicely if the template cannot be interpreted."""
-        if ex.args and ex.args[0].startswith("UndefinedError: 'None' has no attribute"):
-            # Common during HA startup - so just a warning
-            _LOGGER.warning(ex)
-            return
-        _LOGGER.error("Error parsing template for field %s", field)
-        _LOGGER.error(ex)
+        return self._call_on_remove_callbacks

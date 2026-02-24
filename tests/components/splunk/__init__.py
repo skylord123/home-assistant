@@ -1,1 +1,1 @@
-"""Tests for the splunk component."""
+"""Tests for the Splunk integration."""

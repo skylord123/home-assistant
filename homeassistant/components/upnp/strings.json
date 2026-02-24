@@ -1,30 +1,74 @@
 {
-    "config": {
-        "title": "UPnP/IGD",
-        "step": {
-            "init": {
-                "title": "UPnP/IGD"
-            },
-            "confirm": {
-                "title": "UPnP/IGD",
-                "description": "Do you want to set up UPnP/IGD?"
-            },
-            "user": {
-                "title": "Configuration options for the UPnP/IGD",
-                "data": {
-                    "enable_port_mapping": "Enable port mapping for Home Assistant",
-                    "enable_sensors": "Add traffic sensors",
-                    "igd": "UPnP/IGD"
-                }
-            }
-        },
-        "abort": {
-            "already_configured": "UPnP/IGD is already configured",
-            "incomplete_device": "Ignoring incomplete UPnP device",
-            "no_devices_discovered": "No UPnP/IGDs discovered",
-            "no_devices_found": "No UPnP/IGD devices found on the network.",
-            "no_sensors_or_port_mapping": "Enable at least sensors or port mapping",
-            "single_instance_allowed": "Only a single configuration of UPnP/IGD is necessary."
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "incomplete_discovery": "Incomplete discovery",
+      "no_devices_found": "[%key:common::config_flow::abort::no_devices_found%]"
+    },
+    "flow_title": "{name}",
+    "step": {
+      "ssdp_confirm": {
+        "description": "Do you want to set up this UPnP/IGD device?"
+      },
+      "user": {
+        "data": {
+          "unique_id": "[%key:common::config_flow::data::device%]"
         }
+      }
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "wan_status": {
+        "name": "[%key:component::upnp::entity::sensor::wan_status::name%]"
+      }
+    },
+    "sensor": {
+      "data_received": {
+        "name": "Data received"
+      },
+      "data_sent": {
+        "name": "Data sent"
+      },
+      "download_speed": {
+        "name": "Download speed"
+      },
+      "external_ip": {
+        "name": "External IP"
+      },
+      "packet_download_speed": {
+        "name": "Packet download speed"
+      },
+      "packet_upload_speed": {
+        "name": "Packet upload speed"
+      },
+      "packets_received": {
+        "name": "Packets received"
+      },
+      "packets_sent": {
+        "name": "Packets sent"
+      },
+      "port_mapping_number_of_entries_ipv4": {
+        "name": "Number of port mapping entries (IPv4)"
+      },
+      "upload_speed": {
+        "name": "Upload speed"
+      },
+      "uptime": {
+        "name": "Uptime"
+      },
+      "wan_status": {
+        "name": "WAN status"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "force_poll": "Force polling of all data"
+        }
+      }
+    }
+  }
 }

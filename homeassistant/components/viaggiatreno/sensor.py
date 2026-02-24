@@ -1,29 +1,35 @@
 """Support for the Italian train system using ViaggiaTreno API."""
-import asyncio
+
+from __future__ import annotations
+
+from datetime import timedelta
 import logging
+from typing import Any
 
 import aiohttp
-import async_timeout
+from viaggiatreno_ha.trainline import (
+    TrainLine,
+    TrainLineStatus,
+    TrainState,
+    Viaggiatreno,
+)
 import voluptuous as vol
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import ATTR_ATTRIBUTION
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
+from homeassistant.const import UnitOfTime
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType, StateType
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTRIBUTION = "Powered by ViaggiaTreno Data"
-
-VIAGGIATRENO_ENDPOINT = (
-    "http://www.viaggiatreno.it/viaggiatrenonew/"
-    "resteasy/viaggiatreno/andamentoTreno/"
-    "{station_id}/{train_id}"
-)
-
-REQUEST_TIMEOUT = 5  # seconds
 ICON = "mdi:train"
-MONITORED_INFO = [
+MONITORED_INFO = [  # Backward compatibility with older versions
     "categoria",
     "compOrarioArrivoZeroEffettivo",
     "compOrarioPartenzaZeroEffettivo",
@@ -39,7 +45,6 @@ DEFAULT_NAME = "Train {}"
 
 CONF_NAME = "train_name"
 CONF_STATION_ID = "station_id"
-CONF_STATION_NAME = "station_name"
 CONF_TRAIN_ID = "train_id"
 
 ARRIVED_STRING = "Arrived"
@@ -47,7 +52,9 @@ CANCELLED_STRING = "Cancelled"
 NOT_DEPARTED_STRING = "Not departed yet"
 NO_INFORMATION_STRING = "No information for this train now"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+SCAN_INTERVAL = timedelta(minutes=2)
+
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_TRAIN_ID): cv.string,
         vol.Required(CONF_STATION_ID): cv.string,
@@ -56,126 +63,101 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the ViaggiaTreno platform."""
-    train_id = config.get(CONF_TRAIN_ID)
-    station_id = config.get(CONF_STATION_ID)
-    name = config.get(CONF_NAME)
-    if not name:
+    train_id = str(config.get(CONF_TRAIN_ID))
+    station_id = str(config.get(CONF_STATION_ID))
+    if not (name := config.get(CONF_NAME)):
         name = DEFAULT_NAME.format(train_id)
-    async_add_entities([ViaggiaTrenoSensor(train_id, station_id, name)])
+    tl = TrainLine(train_id=train_id, starting_station=station_id)
+    async_add_entities([ViaggiaTrenoSensor(tl, name)], True)
 
 
-async def async_http_request(hass, uri):
-    """Perform actual request."""
-    try:
-        session = hass.helpers.aiohttp_client.async_get_clientsession(hass)
-        with async_timeout.timeout(REQUEST_TIMEOUT):
-            req = await session.get(uri)
-        if req.status != 200:
-            return {"error": req.status}
-        json_response = await req.json()
-        return json_response
-    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-        _LOGGER.error("Cannot connect to ViaggiaTreno API endpoint: %s", exc)
-    except ValueError:
-        _LOGGER.error("Received non-JSON data from ViaggiaTreno API endpoint")
-
-
-class ViaggiaTrenoSensor(Entity):
+class ViaggiaTrenoSensor(SensorEntity):
     """Implementation of a ViaggiaTreno sensor."""
 
-    def __init__(self, train_id, station_id, name):
-        """Initialize the sensor."""
-        self._state = None
-        self._attributes = {}
-        self._unit = ""
-        self._icon = ICON
-        self._station_id = station_id
-        self._name = name
+    _attr_attribution = "Powered by ViaggiaTreno Data"
+    _attr_should_poll = True
 
-        self.uri = VIAGGIATRENO_ENDPOINT.format(
-            station_id=station_id, train_id=train_id
-        )
+    def __init__(self, train_line: TrainLine, name: str) -> None:
+        """Initialize the sensor."""
+        self._state: StateType = NO_INFORMATION_STRING
+        self._attributes: dict[str, Any] = {}
+        self._icon = ICON
+        self._name = name
+        self._line = train_line
+        self._viaggiatreno: Viaggiatreno | None = None
+        self._tstatus: TrainLineStatus | None = None
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def state(self):
+    def native_value(self) -> StateType:
         """Return the state of the sensor."""
         return self._state
 
     @property
-    def icon(self):
+    def icon(self) -> str:
         """Icon to use in the frontend, if any."""
         return self._icon
 
     @property
-    def unit_of_measurement(self):
+    def native_unit_of_measurement(self) -> str | None:
         """Return the unit of measurement."""
-        return self._unit
+        if isinstance(self.native_value, (int, float)):
+            return UnitOfTime.MINUTES
+        return None
 
     @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra attributes."""
-        self._attributes[ATTR_ATTRIBUTION] = ATTRIBUTION
         return self._attributes
 
-    @staticmethod
-    def has_departed(data):
-        """Check if the train has actually departed."""
-        try:
-            first_station = data["fermate"][0]
-            if data["oraUltimoRilevamento"] or first_station["effettiva"]:
-                return True
-        except ValueError:
-            _LOGGER.error("Cannot fetch first station: %s", data)
-        return False
-
-    @staticmethod
-    def has_arrived(data):
-        """Check if the train has already arrived."""
-        last_station = data["fermate"][-1]
-        if not last_station["effettiva"]:
-            return False
-        return True
-
-    @staticmethod
-    def is_cancelled(data):
-        """Check if the train is cancelled."""
-        if data["tipoTreno"] == "ST" and data["provvedimento"] == 1:
-            return True
-        return False
-
-    async def async_update(self):
+    async def async_update(self) -> None:
         """Update state."""
-        uri = self.uri
-        res = await async_http_request(self.hass, uri)
-        if res.get("error", ""):
-            if res["error"] == 204:
-                self._state = NO_INFORMATION_STRING
-                self._unit = ""
-            else:
-                self._state = "Error: {}".format(res["error"])
-                self._unit = ""
-        else:
-            for i in MONITORED_INFO:
-                self._attributes[i] = res[i]
-
-            if self.is_cancelled(res):
+        if self._viaggiatreno is None:
+            session = async_get_clientsession(self.hass)
+            self._viaggiatreno = Viaggiatreno(session)
+        try:
+            await self._viaggiatreno.query_if_useful(self._line)
+            self._tstatus = self._viaggiatreno.get_line_status(self._line)
+            if self._tstatus is None:
+                _LOGGER.error(
+                    "Received status for line %s: None. Check the train and station IDs",
+                    self._line,
+                )
+                return
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            _LOGGER.error("Cannot connect to ViaggiaTreno API endpoint: %s", exc)
+            return
+        except ValueError:
+            _LOGGER.error("Received non-JSON data from ViaggiaTreno API endpoint")
+            return
+        if self._tstatus is not None:
+            if self._tstatus.state == TrainState.CANCELLED:
                 self._state = CANCELLED_STRING
                 self._icon = "mdi:cancel"
-                self._unit = ""
-            elif not self.has_departed(res):
+            elif self._tstatus.state == TrainState.NOT_YET_DEPARTED:
                 self._state = NOT_DEPARTED_STRING
-                self._unit = ""
-            elif self.has_arrived(res):
+            elif self._tstatus.state == TrainState.ARRIVED:
                 self._state = ARRIVED_STRING
-                self._unit = ""
-            else:
-                self._state = res.get("ritardo")
-                self._unit = "min"
+            elif self._tstatus.state in {
+                TrainState.RUNNING,
+                TrainState.PARTIALLY_CANCELLED,
+            }:
+                delay_minutes = self._tstatus.timetable.delay
+                self._state = delay_minutes
                 self._icon = ICON
+            else:
+                self._state = NO_INFORMATION_STRING
+            # Update attributes
+            for info in MONITORED_INFO:
+                self._attributes[info] = self._viaggiatreno.json[self._line][info]

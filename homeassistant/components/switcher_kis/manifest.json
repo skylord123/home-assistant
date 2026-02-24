@@ -1,12 +1,13 @@
 {
   "domain": "switcher_kis",
   "name": "Switcher",
-  "documentation": "https://www.home-assistant.io/integrations/switcher_kis/",
-  "codeowners": [
-    "@tomerfi"
-  ],
-  "requirements": [
-    "aioswitcher==2019.4.26"
-  ],
-  "dependencies": []
+  "codeowners": ["@thecode", "@YogevBokobza"],
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/switcher_kis",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["aioswitcher"],
+  "quality_scale": "silver",
+  "requirements": ["aioswitcher==6.1.0"],
+  "single_config_entry": true
 }

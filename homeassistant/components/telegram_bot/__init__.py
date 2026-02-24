@@ -1,786 +1,884 @@
 """Support to send and receive Telegram messages."""
-import io
-from ipaddress import ip_network
-from functools import partial
-import importlib
-import logging
 
-import requests
-from requests.auth import HTTPBasicAuth, HTTPDigestAuth
-from telegram import (
-    Bot,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
-from telegram.error import TelegramError
-from telegram.parsemode import ParseMode
-from telegram.utils.request import Request
+from __future__ import annotations
+
+import logging
+from typing import Protocol, cast
+
+from telegram import Bot
+from telegram.constants import InputMediaType
+from telegram.error import InvalidToken, TelegramError
 import voluptuous as vol
 
-from homeassistant.components.notify import ATTR_DATA, ATTR_MESSAGE, ATTR_TITLE
+from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
-    ATTR_COMMAND,
+    ATTR_DOMAIN,
+    ATTR_ENTITY_ID,
     ATTR_LATITUDE,
     ATTR_LONGITUDE,
-    CONF_API_KEY,
+    ATTR_SERVICE,
     CONF_PLATFORM,
-    CONF_TIMEOUT,
-    HTTP_DIGEST_AUTHENTICATION,
-    CONF_URL,
+    Platform,
 )
-import homeassistant.helpers.config_validation as cv
-from homeassistant.exceptions import TemplateError
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    ServiceValidationError,
+)
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.target import (
+    TargetSelection,
+    async_extract_referenced_entity_ids,
+)
+from homeassistant.helpers.typing import ConfigType, VolSchemaType
+from homeassistant.util.json import JsonValueType
+
+from . import broadcast, polling, webhooks
+from .bot import (
+    BaseTelegramBot,
+    TelegramBotConfigEntry,
+    TelegramNotificationService,
+    initialize_bot,
+)
+from .const import (
+    ATTR_ALLOWS_MULTIPLE_ANSWERS,
+    ATTR_AUTHENTICATION,
+    ATTR_CALLBACK_QUERY_ID,
+    ATTR_CAPTION,
+    ATTR_CHAT_ACTION,
+    ATTR_CHAT_ID,
+    ATTR_DIRECTORY_PATH,
+    ATTR_DISABLE_NOTIF,
+    ATTR_DISABLE_WEB_PREV,
+    ATTR_FILE,
+    ATTR_FILE_ID,
+    ATTR_FILE_NAME,
+    ATTR_IS_ANONYMOUS,
+    ATTR_IS_BIG,
+    ATTR_KEYBOARD,
+    ATTR_KEYBOARD_INLINE,
+    ATTR_MEDIA_TYPE,
+    ATTR_MESSAGE,
+    ATTR_MESSAGE_ID,
+    ATTR_MESSAGE_TAG,
+    ATTR_MESSAGE_THREAD_ID,
+    ATTR_ONE_TIME_KEYBOARD,
+    ATTR_OPEN_PERIOD,
+    ATTR_OPTIONS,
+    ATTR_PARSER,
+    ATTR_PASSWORD,
+    ATTR_QUESTION,
+    ATTR_REACTION,
+    ATTR_REPLY_TO_MSGID,
+    ATTR_RESIZE_KEYBOARD,
+    ATTR_SHOW_ALERT,
+    ATTR_STICKER_ID,
+    ATTR_TARGET,
+    ATTR_TIMEOUT,
+    ATTR_TITLE,
+    ATTR_URL,
+    ATTR_USERNAME,
+    ATTR_VERIFY_SSL,
+    CHAT_ACTION_CHOOSE_STICKER,
+    CHAT_ACTION_FIND_LOCATION,
+    CHAT_ACTION_RECORD_VIDEO,
+    CHAT_ACTION_RECORD_VIDEO_NOTE,
+    CHAT_ACTION_RECORD_VOICE,
+    CHAT_ACTION_TYPING,
+    CHAT_ACTION_UPLOAD_DOCUMENT,
+    CHAT_ACTION_UPLOAD_PHOTO,
+    CHAT_ACTION_UPLOAD_VIDEO,
+    CHAT_ACTION_UPLOAD_VIDEO_NOTE,
+    CHAT_ACTION_UPLOAD_VOICE,
+    CONF_API_ENDPOINT,
+    CONF_CONFIG_ENTRY_ID,
+    DEFAULT_API_ENDPOINT,
+    DOMAIN,
+    PARSER_HTML,
+    PARSER_MD,
+    PARSER_MD2,
+    PARSER_PLAIN_TEXT,
+    PLATFORM_BROADCAST,
+    PLATFORM_POLLING,
+    PLATFORM_WEBHOOKS,
+    SERVICE_ANSWER_CALLBACK_QUERY,
+    SERVICE_DELETE_MESSAGE,
+    SERVICE_DOWNLOAD_FILE,
+    SERVICE_EDIT_CAPTION,
+    SERVICE_EDIT_MESSAGE,
+    SERVICE_EDIT_MESSAGE_MEDIA,
+    SERVICE_EDIT_REPLYMARKUP,
+    SERVICE_LEAVE_CHAT,
+    SERVICE_SEND_ANIMATION,
+    SERVICE_SEND_CHAT_ACTION,
+    SERVICE_SEND_DOCUMENT,
+    SERVICE_SEND_LOCATION,
+    SERVICE_SEND_MESSAGE,
+    SERVICE_SEND_PHOTO,
+    SERVICE_SEND_POLL,
+    SERVICE_SEND_STICKER,
+    SERVICE_SEND_VIDEO,
+    SERVICE_SEND_VOICE,
+    SERVICE_SET_MESSAGE_REACTION,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTR_ARGS = "args"
-ATTR_AUTHENTICATION = "authentication"
-ATTR_CALLBACK_QUERY = "callback_query"
-ATTR_CALLBACK_QUERY_ID = "callback_query_id"
-ATTR_CAPTION = "caption"
-ATTR_CHAT_ID = "chat_id"
-ATTR_CHAT_INSTANCE = "chat_instance"
-ATTR_DISABLE_NOTIF = "disable_notification"
-ATTR_DISABLE_WEB_PREV = "disable_web_page_preview"
-ATTR_EDITED_MSG = "edited_message"
-ATTR_FILE = "file"
-ATTR_FROM_FIRST = "from_first"
-ATTR_FROM_LAST = "from_last"
-ATTR_KEYBOARD = "keyboard"
-ATTR_KEYBOARD_INLINE = "inline_keyboard"
-ATTR_MESSAGEID = "message_id"
-ATTR_MSG = "message"
-ATTR_MSGID = "id"
-ATTR_PARSER = "parse_mode"
-ATTR_PASSWORD = "password"
-ATTR_REPLY_TO_MSGID = "reply_to_message_id"
-ATTR_REPLYMARKUP = "reply_markup"
-ATTR_SHOW_ALERT = "show_alert"
-ATTR_TARGET = "target"
-ATTR_TEXT = "text"
-ATTR_URL = "url"
-ATTR_USER_ID = "user_id"
-ATTR_USERNAME = "username"
-ATTR_VERIFY_SSL = "verify_ssl"
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-CONF_ALLOWED_CHAT_IDS = "allowed_chat_ids"
-CONF_PROXY_URL = "proxy_url"
-CONF_PROXY_PARAMS = "proxy_params"
-CONF_TRUSTED_NETWORKS = "trusted_networks"
-
-DOMAIN = "telegram_bot"
-
-SERVICE_SEND_MESSAGE = "send_message"
-SERVICE_SEND_PHOTO = "send_photo"
-SERVICE_SEND_STICKER = "send_sticker"
-SERVICE_SEND_VIDEO = "send_video"
-SERVICE_SEND_DOCUMENT = "send_document"
-SERVICE_SEND_LOCATION = "send_location"
-SERVICE_EDIT_MESSAGE = "edit_message"
-SERVICE_EDIT_CAPTION = "edit_caption"
-SERVICE_EDIT_REPLYMARKUP = "edit_replymarkup"
-SERVICE_ANSWER_CALLBACK_QUERY = "answer_callback_query"
-SERVICE_DELETE_MESSAGE = "delete_message"
-SERVICE_LEAVE_CHAT = "leave_chat"
-
-EVENT_TELEGRAM_CALLBACK = "telegram_callback"
-EVENT_TELEGRAM_COMMAND = "telegram_command"
-EVENT_TELEGRAM_TEXT = "telegram_text"
-
-PARSER_HTML = "html"
-PARSER_MD = "markdown"
-
-DEFAULT_TRUSTED_NETWORKS = [ip_network("149.154.160.0/20"), ip_network("91.108.4.0/22")]
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.All(
-            cv.ensure_list,
-            [
-                vol.Schema(
-                    {
-                        vol.Required(CONF_PLATFORM): vol.In(
-                            ("broadcast", "polling", "webhooks")
-                        ),
-                        vol.Required(CONF_API_KEY): cv.string,
-                        vol.Required(CONF_ALLOWED_CHAT_IDS): vol.All(
-                            cv.ensure_list, [vol.Coerce(int)]
-                        ),
-                        vol.Optional(ATTR_PARSER, default=PARSER_MD): cv.string,
-                        vol.Optional(CONF_PROXY_URL): cv.string,
-                        vol.Optional(CONF_PROXY_PARAMS): dict,
-                        # webhooks
-                        vol.Optional(CONF_URL): cv.url,
-                        vol.Optional(
-                            CONF_TRUSTED_NETWORKS, default=DEFAULT_TRUSTED_NETWORKS
-                        ): vol.All(cv.ensure_list, [ip_network]),
-                    }
-                )
-            ],
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+ATTR_PARSER_SCHEMA = vol.All(
+    cv.string,
+    vol.In([PARSER_HTML, PARSER_MD, PARSER_MD2, PARSER_PLAIN_TEXT]),
 )
 
 BASE_SERVICE_SCHEMA = vol.Schema(
     {
+        vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(ATTR_TARGET): vol.All(cv.ensure_list, [vol.Coerce(int)]),
-        vol.Optional(ATTR_PARSER): cv.string,
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_CHAT_ID): vol.All(cv.ensure_list, [vol.Coerce(int)]),
+        vol.Optional(ATTR_PARSER): ATTR_PARSER_SCHEMA,
         vol.Optional(ATTR_DISABLE_NOTIF): cv.boolean,
         vol.Optional(ATTR_DISABLE_WEB_PREV): cv.boolean,
+        vol.Optional(ATTR_RESIZE_KEYBOARD): cv.boolean,
+        vol.Optional(ATTR_ONE_TIME_KEYBOARD): cv.boolean,
         vol.Optional(ATTR_KEYBOARD): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(ATTR_KEYBOARD_INLINE): cv.ensure_list,
-        vol.Optional(CONF_TIMEOUT): vol.Coerce(float),
-    },
-    extra=vol.ALLOW_EXTRA,
+        vol.Optional(ATTR_TIMEOUT): cv.positive_int,
+        vol.Optional(ATTR_MESSAGE_TAG): cv.string,
+        vol.Optional(ATTR_MESSAGE_THREAD_ID): vol.Coerce(int),
+    }
 )
 
-SERVICE_SCHEMA_SEND_MESSAGE = BASE_SERVICE_SCHEMA.extend(
-    {vol.Required(ATTR_MESSAGE): cv.template, vol.Optional(ATTR_TITLE): cv.template}
+SERVICE_SCHEMA_SEND_MESSAGE = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    BASE_SERVICE_SCHEMA.extend(
+        {
+            vol.Required(ATTR_MESSAGE): cv.string,
+            vol.Optional(ATTR_TITLE): cv.string,
+            vol.Optional(ATTR_REPLY_TO_MSGID): vol.Coerce(int),
+        }
+    ),
 )
 
-SERVICE_SCHEMA_SEND_FILE = BASE_SERVICE_SCHEMA.extend(
+SERVICE_SCHEMA_SEND_CHAT_ACTION = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    vol.Schema(
+        {
+            vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+            vol.Optional(ATTR_TARGET): vol.All(cv.ensure_list, [vol.Coerce(int)]),
+            vol.Optional(ATTR_CHAT_ID): vol.All(cv.ensure_list, [vol.Coerce(int)]),
+            vol.Required(ATTR_CHAT_ACTION): vol.In(
+                (
+                    CHAT_ACTION_TYPING,
+                    CHAT_ACTION_UPLOAD_PHOTO,
+                    CHAT_ACTION_RECORD_VIDEO,
+                    CHAT_ACTION_UPLOAD_VIDEO,
+                    CHAT_ACTION_RECORD_VOICE,
+                    CHAT_ACTION_UPLOAD_VOICE,
+                    CHAT_ACTION_UPLOAD_DOCUMENT,
+                    CHAT_ACTION_CHOOSE_STICKER,
+                    CHAT_ACTION_FIND_LOCATION,
+                    CHAT_ACTION_RECORD_VIDEO_NOTE,
+                    CHAT_ACTION_UPLOAD_VIDEO_NOTE,
+                )
+            ),
+            vol.Optional(ATTR_MESSAGE_THREAD_ID): vol.Coerce(int),
+        }
+    ),
+)
+
+SERVICE_SCHEMA_BASE_SEND_FILE = BASE_SERVICE_SCHEMA.extend(
     {
-        vol.Optional(ATTR_URL): cv.template,
-        vol.Optional(ATTR_FILE): cv.template,
-        vol.Optional(ATTR_CAPTION): cv.template,
+        vol.Optional(ATTR_URL): cv.string,
+        vol.Optional(ATTR_FILE): cv.string,
+        vol.Optional(ATTR_CAPTION): cv.string,
         vol.Optional(ATTR_USERNAME): cv.string,
         vol.Optional(ATTR_PASSWORD): cv.string,
         vol.Optional(ATTR_AUTHENTICATION): cv.string,
         vol.Optional(ATTR_VERIFY_SSL): cv.boolean,
+        vol.Optional(ATTR_REPLY_TO_MSGID): vol.Coerce(int),
     }
 )
 
-SERVICE_SCHEMA_SEND_LOCATION = BASE_SERVICE_SCHEMA.extend(
-    {
-        vol.Required(ATTR_LONGITUDE): cv.template,
-        vol.Required(ATTR_LATITUDE): cv.template,
-    }
+SERVICE_SCHEMA_SEND_FILE = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    SERVICE_SCHEMA_BASE_SEND_FILE,
 )
 
-SERVICE_SCHEMA_EDIT_MESSAGE = SERVICE_SCHEMA_SEND_MESSAGE.extend(
-    {
-        vol.Required(ATTR_MESSAGEID): vol.Any(
-            cv.positive_int, vol.All(cv.string, "last")
-        ),
-        vol.Required(ATTR_CHAT_ID): vol.Coerce(int),
-    }
+
+SERVICE_SCHEMA_SEND_STICKER = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    SERVICE_SCHEMA_BASE_SEND_FILE.extend({vol.Optional(ATTR_STICKER_ID): cv.string}),
+)
+
+SERVICE_SCHEMA_SEND_LOCATION = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    BASE_SERVICE_SCHEMA.extend(
+        {
+            vol.Required(ATTR_LONGITUDE): cv.string,
+            vol.Required(ATTR_LATITUDE): cv.string,
+            vol.Optional(ATTR_REPLY_TO_MSGID): vol.Coerce(int),
+        }
+    ),
+)
+
+SERVICE_SCHEMA_SEND_POLL = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    vol.Schema(
+        {
+            vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+            vol.Optional(ATTR_CHAT_ID): vol.All(cv.ensure_list, [vol.Coerce(int)]),
+            vol.Optional(ATTR_TARGET): vol.All(cv.ensure_list, [vol.Coerce(int)]),
+            vol.Required(ATTR_QUESTION): cv.string,
+            vol.Required(ATTR_OPTIONS): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional(ATTR_OPEN_PERIOD): cv.positive_int,
+            vol.Optional(ATTR_IS_ANONYMOUS, default=True): cv.boolean,
+            vol.Optional(ATTR_ALLOWS_MULTIPLE_ANSWERS, default=False): cv.boolean,
+            vol.Optional(ATTR_DISABLE_NOTIF): cv.boolean,
+            vol.Optional(ATTR_MESSAGE_THREAD_ID): vol.Coerce(int),
+            vol.Optional(ATTR_REPLY_TO_MSGID): vol.Coerce(int),
+        }
+    ),
+)
+
+SERVICE_SCHEMA_EDIT_MESSAGE = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    vol.Schema(
+        {
+            vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+            vol.Optional(ATTR_TITLE): cv.string,
+            vol.Required(ATTR_MESSAGE): cv.string,
+            vol.Required(ATTR_MESSAGE_ID): vol.Any(
+                cv.positive_int, vol.All(cv.string, "last")
+            ),
+            vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
+            vol.Optional(ATTR_PARSER): ATTR_PARSER_SCHEMA,
+            vol.Optional(ATTR_KEYBOARD_INLINE): cv.ensure_list,
+            vol.Optional(ATTR_DISABLE_WEB_PREV): cv.boolean,
+        }
+    ),
+)
+
+SERVICE_SCHEMA_EDIT_MESSAGE_MEDIA = vol.All(
+    cv.deprecated(ATTR_TIMEOUT),
+    vol.Schema(
+        {
+            vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+            vol.Required(ATTR_MESSAGE_ID): vol.Any(
+                cv.positive_int, vol.All(cv.string, "last")
+            ),
+            vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
+            vol.Optional(ATTR_CAPTION): cv.string,
+            vol.Optional(ATTR_PARSER): ATTR_PARSER_SCHEMA,
+            vol.Required(ATTR_MEDIA_TYPE): vol.In(
+                (
+                    str(InputMediaType.ANIMATION),
+                    str(InputMediaType.AUDIO),
+                    str(InputMediaType.VIDEO),
+                    str(InputMediaType.DOCUMENT),
+                    str(InputMediaType.PHOTO),
+                )
+            ),
+            vol.Optional(ATTR_URL): cv.string,
+            vol.Optional(ATTR_FILE): cv.string,
+            vol.Optional(ATTR_USERNAME): cv.string,
+            vol.Optional(ATTR_PASSWORD): cv.string,
+            vol.Optional(ATTR_AUTHENTICATION): cv.string,
+            vol.Optional(ATTR_VERIFY_SSL): cv.boolean,
+            vol.Optional(ATTR_KEYBOARD_INLINE): cv.ensure_list,
+        }
+    ),
 )
 
 SERVICE_SCHEMA_EDIT_CAPTION = vol.Schema(
     {
-        vol.Required(ATTR_MESSAGEID): vol.Any(
+        vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Required(ATTR_MESSAGE_ID): vol.Any(
             cv.positive_int, vol.All(cv.string, "last")
         ),
-        vol.Required(ATTR_CHAT_ID): vol.Coerce(int),
-        vol.Required(ATTR_CAPTION): cv.template,
+        vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
+        vol.Optional(ATTR_PARSER): ATTR_PARSER_SCHEMA,
+        vol.Required(ATTR_CAPTION): cv.string,
         vol.Optional(ATTR_KEYBOARD_INLINE): cv.ensure_list,
-    },
-    extra=vol.ALLOW_EXTRA,
+    }
 )
 
 SERVICE_SCHEMA_EDIT_REPLYMARKUP = vol.Schema(
     {
-        vol.Required(ATTR_MESSAGEID): vol.Any(
+        vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Required(ATTR_MESSAGE_ID): vol.Any(
             cv.positive_int, vol.All(cv.string, "last")
         ),
-        vol.Required(ATTR_CHAT_ID): vol.Coerce(int),
+        vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
         vol.Required(ATTR_KEYBOARD_INLINE): cv.ensure_list,
-    },
-    extra=vol.ALLOW_EXTRA,
+    }
 )
 
 SERVICE_SCHEMA_ANSWER_CALLBACK_QUERY = vol.Schema(
     {
-        vol.Required(ATTR_MESSAGE): cv.template,
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Required(ATTR_MESSAGE): cv.string,
         vol.Required(ATTR_CALLBACK_QUERY_ID): vol.Coerce(int),
         vol.Optional(ATTR_SHOW_ALERT): cv.boolean,
-    },
-    extra=vol.ALLOW_EXTRA,
+    }
 )
 
 SERVICE_SCHEMA_DELETE_MESSAGE = vol.Schema(
     {
-        vol.Required(ATTR_CHAT_ID): vol.Coerce(int),
-        vol.Required(ATTR_MESSAGEID): vol.Any(
+        vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
+        vol.Required(ATTR_MESSAGE_ID): vol.Any(
             cv.positive_int, vol.All(cv.string, "last")
         ),
-    },
-    extra=vol.ALLOW_EXTRA,
+    }
 )
 
-SERVICE_SCHEMA_LEAVE_CHAT = vol.Schema({vol.Required(ATTR_CHAT_ID): vol.Coerce(int)})
+SERVICE_SCHEMA_LEAVE_CHAT = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTITY_ID): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
+    }
+)
 
-SERVICE_MAP = {
+SERVICE_SCHEMA_SET_MESSAGE_REACTION = vol.Schema(
+    {
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Required(ATTR_MESSAGE_ID): vol.Any(
+            cv.positive_int, vol.All(cv.string, "last")
+        ),
+        vol.Optional(ATTR_CHAT_ID): vol.Coerce(int),
+        vol.Required(ATTR_REACTION): cv.string,
+        vol.Optional(ATTR_IS_BIG, default=False): cv.boolean,
+    }
+)
+
+SERVICE_SCHEMA_DOWNLOAD_FILE = vol.Schema(
+    {
+        vol.Optional(CONF_CONFIG_ENTRY_ID): cv.string,
+        vol.Required(ATTR_FILE_ID): cv.string,
+        vol.Optional(ATTR_DIRECTORY_PATH): cv.string,
+        vol.Optional(ATTR_FILE_NAME): cv.string,
+    }
+)
+
+SERVICE_MAP: dict[str, VolSchemaType] = {
     SERVICE_SEND_MESSAGE: SERVICE_SCHEMA_SEND_MESSAGE,
+    SERVICE_SEND_CHAT_ACTION: SERVICE_SCHEMA_SEND_CHAT_ACTION,
     SERVICE_SEND_PHOTO: SERVICE_SCHEMA_SEND_FILE,
-    SERVICE_SEND_STICKER: SERVICE_SCHEMA_SEND_FILE,
+    SERVICE_SEND_STICKER: SERVICE_SCHEMA_SEND_STICKER,
+    SERVICE_SEND_ANIMATION: SERVICE_SCHEMA_SEND_FILE,
     SERVICE_SEND_VIDEO: SERVICE_SCHEMA_SEND_FILE,
+    SERVICE_SEND_VOICE: SERVICE_SCHEMA_SEND_FILE,
     SERVICE_SEND_DOCUMENT: SERVICE_SCHEMA_SEND_FILE,
     SERVICE_SEND_LOCATION: SERVICE_SCHEMA_SEND_LOCATION,
+    SERVICE_SEND_POLL: SERVICE_SCHEMA_SEND_POLL,
     SERVICE_EDIT_MESSAGE: SERVICE_SCHEMA_EDIT_MESSAGE,
+    SERVICE_EDIT_MESSAGE_MEDIA: SERVICE_SCHEMA_EDIT_MESSAGE_MEDIA,
     SERVICE_EDIT_CAPTION: SERVICE_SCHEMA_EDIT_CAPTION,
     SERVICE_EDIT_REPLYMARKUP: SERVICE_SCHEMA_EDIT_REPLYMARKUP,
     SERVICE_ANSWER_CALLBACK_QUERY: SERVICE_SCHEMA_ANSWER_CALLBACK_QUERY,
     SERVICE_DELETE_MESSAGE: SERVICE_SCHEMA_DELETE_MESSAGE,
     SERVICE_LEAVE_CHAT: SERVICE_SCHEMA_LEAVE_CHAT,
+    SERVICE_SET_MESSAGE_REACTION: SERVICE_SCHEMA_SET_MESSAGE_REACTION,
+    SERVICE_DOWNLOAD_FILE: SERVICE_SCHEMA_DOWNLOAD_FILE,
 }
 
 
-def load_data(
-    hass,
-    url=None,
-    filepath=None,
-    username=None,
-    password=None,
-    authentication=None,
-    num_retries=5,
-    verify_ssl=None,
-):
-    """Load data into ByteIO/File container from a source."""
-    try:
-        if url is not None:
-            # Load data from URL
-            params = {"timeout": 15}
-            if username is not None and password is not None:
-                if authentication == HTTP_DIGEST_AUTHENTICATION:
-                    params["auth"] = HTTPDigestAuth(username, password)
-                else:
-                    params["auth"] = HTTPBasicAuth(username, password)
-            if verify_ssl is not None:
-                params["verify"] = verify_ssl
-            retry_num = 0
-            while retry_num < num_retries:
-                req = requests.get(url, **params)
-                if not req.ok:
-                    _LOGGER.warning(
-                        "Status code %s (retry #%s) loading %s",
-                        req.status_code,
-                        retry_num + 1,
-                        url,
-                    )
-                else:
-                    data = io.BytesIO(req.content)
-                    if data.read():
-                        data.seek(0)
-                        data.name = url
-                        return data
-                    _LOGGER.warning("Empty data (retry #%s) in %s)", retry_num + 1, url)
-                retry_num += 1
-            _LOGGER.warning("Can't load data in %s after %s retries", url, retry_num)
-        elif filepath is not None:
-            if hass.config.is_allowed_path(filepath):
-                return open(filepath, "rb")
+class BotPlatformModule(Protocol):
+    """Define the module protocol for telegram bot modules."""
 
-            _LOGGER.warning("'%s' are not secure to load data from!", filepath)
-        else:
-            _LOGGER.warning("Can't load data. No data found in params!")
-
-    except (OSError, TypeError) as error:
-        _LOGGER.error("Can't load data into ByteIO: %s", error)
-
-    return None
+    async def async_setup_bot_platform(
+        self, hass: HomeAssistant, bot: Bot, config: TelegramBotConfigEntry
+    ) -> BaseTelegramBot | None:
+        """Set up the Telegram bot platform."""
 
 
-async def async_setup(hass, config):
+MODULES = {
+    PLATFORM_BROADCAST: broadcast,
+    PLATFORM_POLLING: polling,
+    PLATFORM_WEBHOOKS: webhooks,
+}
+
+PLATFORMS: list[Platform] = [Platform.EVENT, Platform.NOTIFY]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Telegram bot component."""
-    if not config[DOMAIN]:
-        return False
-
-    for p_config in config[DOMAIN]:
-
-        p_type = p_config.get(CONF_PLATFORM)
-
-        platform = importlib.import_module(
-            ".{}".format(p_config[CONF_PLATFORM]), __name__
-        )
-
-        _LOGGER.info("Setting up %s.%s", DOMAIN, p_type)
-        try:
-            receiver_service = await platform.async_setup_platform(hass, p_config)
-            if receiver_service is False:
-                _LOGGER.error("Failed to initialize Telegram bot %s", p_type)
-                return False
-
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Error setting up platform %s", p_type)
-            return False
-
-        bot = initialize_bot(p_config)
-        notify_service = TelegramNotificationService(
-            hass, bot, p_config.get(CONF_ALLOWED_CHAT_IDS), p_config.get(ATTR_PARSER)
-        )
-
-    async def async_send_telegram_message(service):
-        """Handle sending Telegram Bot message service calls."""
-
-        def _render_template_attr(data, attribute):
-            attribute_templ = data.get(attribute)
-            if attribute_templ:
-                if any(
-                    [isinstance(attribute_templ, vtype) for vtype in [float, int, str]]
-                ):
-                    data[attribute] = attribute_templ
-                else:
-                    attribute_templ.hass = hass
-                    try:
-                        data[attribute] = attribute_templ.async_render()
-                    except TemplateError as exc:
-                        _LOGGER.error(
-                            "TemplateError in %s: %s -> %s",
-                            attribute,
-                            attribute_templ.template,
-                            exc,
-                        )
-                        data[attribute] = attribute_templ.template
-
-        msgtype = service.service
-        kwargs = dict(service.data)
-        for attribute in [
-            ATTR_MESSAGE,
-            ATTR_TITLE,
-            ATTR_URL,
-            ATTR_FILE,
-            ATTR_CAPTION,
-            ATTR_LONGITUDE,
-            ATTR_LATITUDE,
-        ]:
-            _render_template_attr(kwargs, attribute)
-        _LOGGER.debug("New telegram message %s: %s", msgtype, kwargs)
-
-        if msgtype == SERVICE_SEND_MESSAGE:
-            await hass.async_add_job(partial(notify_service.send_message, **kwargs))
-        elif msgtype in [
-            SERVICE_SEND_PHOTO,
-            SERVICE_SEND_STICKER,
-            SERVICE_SEND_VIDEO,
-            SERVICE_SEND_DOCUMENT,
-        ]:
-            await hass.async_add_job(
-                partial(notify_service.send_file, msgtype, **kwargs)
-            )
-        elif msgtype == SERVICE_SEND_LOCATION:
-            await hass.async_add_job(partial(notify_service.send_location, **kwargs))
-        elif msgtype == SERVICE_ANSWER_CALLBACK_QUERY:
-            await hass.async_add_job(
-                partial(notify_service.answer_callback_query, **kwargs)
-            )
-        elif msgtype == SERVICE_DELETE_MESSAGE:
-            await hass.async_add_job(partial(notify_service.delete_message, **kwargs))
-        else:
-            await hass.async_add_job(
-                partial(notify_service.edit_message, msgtype, **kwargs)
-            )
 
     # Register notification services
     for service_notif, schema in SERVICE_MAP.items():
+        supports_response = SupportsResponse.NONE
+
+        if service_notif in [
+            SERVICE_SEND_MESSAGE,
+            SERVICE_SEND_CHAT_ACTION,
+            SERVICE_SEND_PHOTO,
+            SERVICE_SEND_ANIMATION,
+            SERVICE_SEND_VIDEO,
+            SERVICE_SEND_VOICE,
+            SERVICE_SEND_DOCUMENT,
+            SERVICE_SEND_STICKER,
+            SERVICE_SEND_LOCATION,
+            SERVICE_SEND_POLL,
+            SERVICE_DOWNLOAD_FILE,
+        ]:
+            supports_response = SupportsResponse.OPTIONAL
+
         hass.services.async_register(
-            DOMAIN, service_notif, async_send_telegram_message, schema=schema
+            DOMAIN,
+            service_notif,
+            _async_send_telegram_message,
+            schema=schema,
+            supports_response=supports_response,
+            description_placeholders={
+                "formatting_options_url": "https://core.telegram.org/bots/api#formatting-options"
+            },
         )
 
     return True
 
 
-def initialize_bot(p_config):
-    """Initialize telegram bot with proxy support."""
+async def _async_send_telegram_message(service: ServiceCall) -> ServiceResponse:
+    """Handle sending Telegram Bot message service calls."""
 
-    api_key = p_config.get(CONF_API_KEY)
-    proxy_url = p_config.get(CONF_PROXY_URL)
-    proxy_params = p_config.get(CONF_PROXY_PARAMS)
+    _deprecate_timeout(service)
 
-    if proxy_url is not None:
-        request = Request(
-            con_pool_size=8, proxy_url=proxy_url, urllib3_proxy_kwargs=proxy_params
+    # this is the list of targets to send the message to
+    targets = _build_targets(service)
+
+    service_responses: JsonValueType = []
+    errors: list[tuple[Exception, str]] = []
+
+    # invoke the service for each target
+    for target_config_entry, target_chat_id, target_notify_entity_id in targets:
+        try:
+            service_response = await _call_service(
+                service, target_config_entry.runtime_data, target_chat_id
+            )
+
+            if service.service == SERVICE_DOWNLOAD_FILE:
+                return service_response
+
+            if service_response is not None:
+                formatted_responses: list[JsonValueType] = []
+                for chat_id, message_id in service_response.items():
+                    formatted_response = {
+                        ATTR_CHAT_ID: int(chat_id),
+                        ATTR_MESSAGE_ID: message_id,
+                    }
+
+                    if target_notify_entity_id:
+                        formatted_response[ATTR_ENTITY_ID] = target_notify_entity_id
+
+                    formatted_responses.append(formatted_response)
+
+                assert isinstance(service_responses, list)
+                service_responses.extend(formatted_responses)
+        except (HomeAssistantError, TelegramError) as ex:
+            target = target_notify_entity_id or str(target_chat_id)
+            errors.append((ex, target))
+
+    if len(errors) == 1:
+        if isinstance(errors[0][0], HomeAssistantError):
+            raise errors[0][0]
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="action_failed",
+            translation_placeholders={"error": str(errors[0][0])},
+        ) from errors[0][0]
+
+    if len(errors) > 1:
+        error_messages: list[str] = []
+        for error, target in errors:
+            target_type = ATTR_CHAT_ID if target.isdigit() else ATTR_ENTITY_ID
+            error_messages.append(f"`{target_type}` {target}: {error}")
+
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="multiple_errors",
+            translation_placeholders={"errors": "\n".join(error_messages)},
+        )
+
+    if service.return_response:
+        return {"chats": service_responses}
+
+    return None
+
+
+async def _call_service(
+    service: ServiceCall, notify_service: TelegramNotificationService, chat_id: int
+) -> dict[str, JsonValueType] | None:
+    """Calls a Telegram bot service using the specified bot and chat_id."""
+
+    service_name = service.service
+
+    kwargs = dict(service.data)
+    kwargs[ATTR_CHAT_ID] = chat_id
+
+    messages: dict[str, JsonValueType] | None = None
+    if service_name == SERVICE_SEND_MESSAGE:
+        messages = await notify_service.send_message(context=service.context, **kwargs)
+    elif service_name == SERVICE_SEND_CHAT_ACTION:
+        messages = await notify_service.send_chat_action(
+            context=service.context, **kwargs
+        )
+    elif service_name in [
+        SERVICE_SEND_PHOTO,
+        SERVICE_SEND_ANIMATION,
+        SERVICE_SEND_VIDEO,
+        SERVICE_SEND_VOICE,
+        SERVICE_SEND_DOCUMENT,
+    ]:
+        messages = await notify_service.send_file(
+            service_name, context=service.context, **kwargs
+        )
+    elif service_name == SERVICE_SEND_STICKER:
+        messages = await notify_service.send_sticker(context=service.context, **kwargs)
+    elif service_name == SERVICE_SEND_LOCATION:
+        messages = await notify_service.send_location(context=service.context, **kwargs)
+    elif service_name == SERVICE_SEND_POLL:
+        messages = await notify_service.send_poll(context=service.context, **kwargs)
+    elif service_name == SERVICE_ANSWER_CALLBACK_QUERY:
+        await notify_service.answer_callback_query(context=service.context, **kwargs)
+    elif service_name == SERVICE_DELETE_MESSAGE:
+        await notify_service.delete_message(context=service.context, **kwargs)
+    elif service_name == SERVICE_LEAVE_CHAT:
+        await notify_service.leave_chat(context=service.context, **kwargs)
+    elif service_name == SERVICE_SET_MESSAGE_REACTION:
+        await notify_service.set_message_reaction(context=service.context, **kwargs)
+    elif service_name == SERVICE_EDIT_MESSAGE_MEDIA:
+        await notify_service.edit_message_media(context=service.context, **kwargs)
+    elif service_name == SERVICE_DOWNLOAD_FILE:
+        return await notify_service.download_file(context=service.context, **kwargs)
+    else:
+        await notify_service.edit_message(
+            service_name, context=service.context, **kwargs
+        )
+
+    if service.return_response and messages is not None:
+        return messages
+
+    return None
+
+
+def _deprecate_timeout(service: ServiceCall) -> None:
+    if ATTR_TIMEOUT not in service.data:
+        return
+
+    # default: service was called using frontend such as developer tools or automation editor
+    service_call_origin = "call_service"
+
+    origin = service.context.origin_event
+    if origin and ATTR_ENTITY_ID in origin.data:
+        # automation
+        service_call_origin = origin.data[ATTR_ENTITY_ID]
+    elif origin and origin.data.get(ATTR_DOMAIN) == SCRIPT_DOMAIN:
+        # script
+        service_call_origin = f"{origin.data[ATTR_DOMAIN]}.{origin.data[ATTR_SERVICE]}"
+
+    ir.async_create_issue(
+        service.hass,
+        DOMAIN,
+        "deprecated_timeout_parameter",
+        breaks_in_ha_version="2026.7.0",
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_timeout_parameter",
+        translation_placeholders={
+            "integration_title": "Telegram Bot",
+            "action": f"{DOMAIN}.{service.service}",
+            "action_origin": service_call_origin,
+        },
+        learn_more_url="https://github.com/home-assistant/core/pull/155198",
+    )
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: TelegramBotConfigEntry
+) -> bool:
+    """Migrate Telegram Bot config entry."""
+
+    version = config_entry.version
+    minor_version = config_entry.minor_version
+    _LOGGER.debug(
+        "Migrating configuration from version %s.%s",
+        version,
+        minor_version,
+    )
+
+    if config_entry.version > 1:
+        # This means the user has downgraded from a future version
+        return False
+
+    # version 1.1: to add default API endpoint
+    if version == 1 and minor_version == 1:
+        new_data = {**config_entry.data}
+        new_data[CONF_API_ENDPOINT] = DEFAULT_API_ENDPOINT
+        updated = hass.config_entries.async_update_entry(
+            config_entry, data=new_data, minor_version=2
+        )
+        _LOGGER.debug(
+            "Migrated Telegram Bot config entry to %s.%s, entry updated: %s",
+            config_entry.version,
+            config_entry.minor_version,
+            updated,
+        )
+
+    return True
+
+
+def _build_targets(
+    service: ServiceCall,
+) -> list[tuple[TelegramBotConfigEntry, int, str]]:
+    """Builds a list of targets from the service parameters.
+
+    Each target is a tuple of (config_entry, chat_id, notify_entity_id).
+    The config_entry identifies the bot to use for the service call.
+    The chat_id or notify_entity_id identifies the recipient of the message.
+    """
+
+    migrate_chat_ids = _warn_chat_id_migration(service)
+
+    targets: list[tuple[TelegramBotConfigEntry, int, str]] = []
+
+    # build target list from notify entities using service data: `entity_id`
+
+    referenced = async_extract_referenced_entity_ids(
+        service.hass, TargetSelection(service.data)
+    )
+    notify_entity_ids = referenced.referenced | referenced.indirectly_referenced
+
+    # parse entity IDs
+    entity_registry = er.async_get(service.hass)
+    for notify_entity_id in notify_entity_ids:
+        # get config entry from notify entity
+        entity_entry = entity_registry.async_get(notify_entity_id)
+        if not entity_entry:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_notify_entity",
+                translation_placeholders={ATTR_ENTITY_ID: notify_entity_id},
+            )
+        assert entity_entry.config_entry_id is not None
+        notify_config_entry = service.hass.config_entries.async_get_known_entry(
+            entity_entry.config_entry_id
+        )
+
+        # get chat id from subentry
+        assert entity_entry.config_subentry_id is not None
+        notify_config_subentry = notify_config_entry.subentries[
+            entity_entry.config_subentry_id
+        ]
+        notify_chat_id: int = notify_config_subentry.data[ATTR_CHAT_ID]
+
+        targets.append((notify_config_entry, notify_chat_id, notify_entity_id))
+
+    # build target list using service data: `config_entry_id` and `chat_id`
+
+    config_entry: TelegramBotConfigEntry | None = None
+    if CONF_CONFIG_ENTRY_ID in service.data:
+        # parse config entry from service data
+        config_entry_id: str = service.data[CONF_CONFIG_ENTRY_ID]
+        config_entry = service.hass.config_entries.async_get_known_entry(
+            config_entry_id
         )
     else:
-        request = Request(con_pool_size=8)
-    return Bot(token=api_key, request=request)
-
-
-class TelegramNotificationService:
-    """Implement the notification services for the Telegram Bot domain."""
-
-    def __init__(self, hass, bot, allowed_chat_ids, parser):
-        """Initialize the service."""
-
-        self.allowed_chat_ids = allowed_chat_ids
-        self._default_user = self.allowed_chat_ids[0]
-        self._last_message_id = {user: None for user in self.allowed_chat_ids}
-        self._parsers = {PARSER_HTML: ParseMode.HTML, PARSER_MD: ParseMode.MARKDOWN}
-        self._parse_mode = self._parsers.get(parser)
-        self.bot = bot
-        self.hass = hass
-
-    def _get_msg_ids(self, msg_data, chat_id):
-        """Get the message id to edit.
-
-        This can be one of (message_id, inline_message_id) from a msg dict,
-        returning a tuple.
-        **You can use 'last' as message_id** to edit
-        the message last sent in the chat_id.
-        """
-        message_id = inline_message_id = None
-        if ATTR_MESSAGEID in msg_data:
-            message_id = msg_data[ATTR_MESSAGEID]
-            if (
-                isinstance(message_id, str)
-                and (message_id == "last")
-                and (self._last_message_id[chat_id] is not None)
-            ):
-                message_id = self._last_message_id[chat_id]
-        else:
-            inline_message_id = msg_data["inline_message_id"]
-        return message_id, inline_message_id
-
-    def _get_target_chat_ids(self, target):
-        """Validate chat_id targets or return default target (first).
-
-        :param target: optional list of integers ([12234, -12345])
-        :return list of chat_id targets (integers)
-        """
-        if target is not None:
-            if isinstance(target, int):
-                target = [target]
-            chat_ids = [t for t in target if t in self.allowed_chat_ids]
-            if chat_ids:
-                return chat_ids
-            _LOGGER.warning(
-                "Disallowed targets: %s, using default: %s", target, self._default_user
-            )
-        return [self._default_user]
-
-    def _get_msg_kwargs(self, data):
-        """Get parameters in message data kwargs."""
-
-        def _make_row_inline_keyboard(row_keyboard):
-            """Make a list of InlineKeyboardButtons.
-
-            It can accept:
-              - a list of tuples like:
-                `[(text_b1, data_callback_b1),
-                (text_b2, data_callback_b2), ...]
-              - a string like: `/cmd1, /cmd2, /cmd3`
-              - or a string like: `text_b1:/cmd1, text_b2:/cmd2`
-            """
-
-            buttons = []
-            if isinstance(row_keyboard, str):
-                for key in row_keyboard.split(","):
-                    if ":/" in key:
-                        # commands like: 'Label:/cmd' become ('Label', '/cmd')
-                        label = key.split(":/")[0]
-                        command = key[len(label) + 1 :]
-                        buttons.append(
-                            InlineKeyboardButton(label, callback_data=command)
-                        )
-                    else:
-                        # commands like: '/cmd' become ('CMD', '/cmd')
-                        label = key.strip()[1:].upper()
-                        buttons.append(InlineKeyboardButton(label, callback_data=key))
-            elif isinstance(row_keyboard, list):
-                for entry in row_keyboard:
-                    text_btn, data_btn = entry
-                    buttons.append(
-                        InlineKeyboardButton(text_btn, callback_data=data_btn)
-                    )
-            else:
-                raise ValueError(str(row_keyboard))
-            return buttons
-
-        # Defaults
-        params = {
-            ATTR_PARSER: self._parse_mode,
-            ATTR_DISABLE_NOTIF: False,
-            ATTR_DISABLE_WEB_PREV: None,
-            ATTR_REPLY_TO_MSGID: None,
-            ATTR_REPLYMARKUP: None,
-            CONF_TIMEOUT: None,
-        }
-        if data is not None:
-            if ATTR_PARSER in data:
-                params[ATTR_PARSER] = self._parsers.get(
-                    data[ATTR_PARSER], self._parse_mode
-                )
-            if CONF_TIMEOUT in data:
-                params[CONF_TIMEOUT] = data[CONF_TIMEOUT]
-            if ATTR_DISABLE_NOTIF in data:
-                params[ATTR_DISABLE_NOTIF] = data[ATTR_DISABLE_NOTIF]
-            if ATTR_DISABLE_WEB_PREV in data:
-                params[ATTR_DISABLE_WEB_PREV] = data[ATTR_DISABLE_WEB_PREV]
-            if ATTR_REPLY_TO_MSGID in data:
-                params[ATTR_REPLY_TO_MSGID] = data[ATTR_REPLY_TO_MSGID]
-            # Keyboards:
-            if ATTR_KEYBOARD in data:
-                keys = data.get(ATTR_KEYBOARD)
-                keys = keys if isinstance(keys, list) else [keys]
-                if keys:
-                    params[ATTR_REPLYMARKUP] = ReplyKeyboardMarkup(
-                        [[key.strip() for key in row.split(",")] for row in keys]
-                    )
-                else:
-                    params[ATTR_REPLYMARKUP] = ReplyKeyboardRemove(True)
-
-            elif ATTR_KEYBOARD_INLINE in data:
-                keys = data.get(ATTR_KEYBOARD_INLINE)
-                keys = keys if isinstance(keys, list) else [keys]
-                params[ATTR_REPLYMARKUP] = InlineKeyboardMarkup(
-                    [_make_row_inline_keyboard(row) for row in keys]
-                )
-        return params
-
-    def _send_msg(self, func_send, msg_error, *args_msg, **kwargs_msg):
-        """Send one message."""
-
-        try:
-            out = func_send(*args_msg, **kwargs_msg)
-            if not isinstance(out, bool) and hasattr(out, ATTR_MESSAGEID):
-                chat_id = out.chat_id
-                self._last_message_id[chat_id] = out[ATTR_MESSAGEID]
-                _LOGGER.debug(
-                    "Last message ID: %s (from chat_id %s)",
-                    self._last_message_id,
-                    chat_id,
-                )
-            elif not isinstance(out, bool):
-                _LOGGER.warning(
-                    "Update last message: out_type:%s, out=%s", type(out), out
-                )
-            return out
-        except TelegramError as exc:
-            _LOGGER.error(
-                "%s: %s. Args: %s, kwargs: %s", msg_error, exc, args_msg, kwargs_msg
-            )
-
-    def send_message(self, message="", target=None, **kwargs):
-        """Send a message to one or multiple pre-allowed chat IDs."""
-        title = kwargs.get(ATTR_TITLE)
-        text = f"{title}\n{message}" if title else message
-        params = self._get_msg_kwargs(kwargs)
-        for chat_id in self._get_target_chat_ids(target):
-            _LOGGER.debug("Send message in chat ID %s with params: %s", chat_id, params)
-            self._send_msg(
-                self.bot.sendMessage, "Error sending message", chat_id, text, **params
-            )
-
-    def delete_message(self, chat_id=None, **kwargs):
-        """Delete a previously sent message."""
-        chat_id = self._get_target_chat_ids(chat_id)[0]
-        message_id, _ = self._get_msg_ids(kwargs, chat_id)
-        _LOGGER.debug("Delete message %s in chat ID %s", message_id, chat_id)
-        deleted = self._send_msg(
-            self.bot.deleteMessage, "Error deleting message", chat_id, message_id
+        # config entry not provided so we try to determine the default
+        config_entries: list[TelegramBotConfigEntry] = (
+            service.hass.config_entries.async_entries(DOMAIN)
         )
-        # reduce message_id anyway:
-        if self._last_message_id[chat_id] is not None:
-            # change last msg_id for deque(n_msgs)?
-            self._last_message_id[chat_id] -= 1
-        return deleted
+        if len(config_entries) == 1:
+            config_entry = config_entries[0]
 
-    def edit_message(self, type_edit, chat_id=None, **kwargs):
-        """Edit a previously sent message."""
-        chat_id = self._get_target_chat_ids(chat_id)[0]
-        message_id, inline_message_id = self._get_msg_ids(kwargs, chat_id)
-        params = self._get_msg_kwargs(kwargs)
-        _LOGGER.debug(
-            "Edit message %s in chat ID %s with params: %s",
-            message_id or inline_message_id,
-            chat_id,
-            params,
-        )
-        if type_edit == SERVICE_EDIT_MESSAGE:
-            message = kwargs.get(ATTR_MESSAGE)
-            title = kwargs.get(ATTR_TITLE)
-            text = f"{title}\n{message}" if title else message
+    # parse chat IDs from service data: `chat_id`
+    if config_entry is not None:
+        chat_ids: set[int] = migrate_chat_ids
+        if ATTR_CHAT_ID in service.data:
+            chat_ids = chat_ids | set(
+                [service.data[ATTR_CHAT_ID]]
+                if isinstance(service.data[ATTR_CHAT_ID], int)
+                else service.data[ATTR_CHAT_ID]
+            )
+
+        if not chat_ids and not targets:
+            # no targets from service data, so we default to the first allowed chat IDs of the config entry
+            subentries = list(config_entry.subentries.values())
+            if not subentries:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN,
+                    translation_key="missing_allowed_chat_ids",
+                    translation_placeholders={
+                        "bot_name": config_entry.title,
+                    },
+                )
+
+            default_chat_id: int = subentries[0].data[ATTR_CHAT_ID]
             _LOGGER.debug(
-                "Editing message with ID %s.", message_id or inline_message_id
+                "Defaulting to chat ID %s for bot %s",
+                default_chat_id,
+                config_entry.title,
             )
-            return self._send_msg(
-                self.bot.editMessageText,
-                "Error editing text message",
-                text,
-                chat_id=chat_id,
-                message_id=message_id,
-                inline_message_id=inline_message_id,
-                **params,
-            )
-        if type_edit == SERVICE_EDIT_CAPTION:
-            func_send = self.bot.editMessageCaption
-            params[ATTR_CAPTION] = kwargs.get(ATTR_CAPTION)
-        else:
-            func_send = self.bot.editMessageReplyMarkup
-        return self._send_msg(
-            func_send,
-            "Error editing message attributes",
-            chat_id=chat_id,
-            message_id=message_id,
-            inline_message_id=inline_message_id,
-            **params,
-        )
+            chat_ids = {default_chat_id}
 
-    def answer_callback_query(
-        self, message, callback_query_id, show_alert=False, **kwargs
-    ):
-        """Answer a callback originated with a press in an inline keyboard."""
-        params = self._get_msg_kwargs(kwargs)
-        _LOGGER.debug(
-            "Answer callback query with callback ID %s: %s, " "alert: %s.",
-            callback_query_id,
-            message,
-            show_alert,
-        )
-        self._send_msg(
-            self.bot.answerCallbackQuery,
-            "Error sending answer callback query",
-            callback_query_id,
-            text=message,
-            show_alert=show_alert,
-            **params,
-        )
+        invalid_chat_ids: set[int] = set()
+        for chat_id in chat_ids:
+            # map chat_id to notify entity ID
 
-    def send_file(self, file_type=SERVICE_SEND_PHOTO, target=None, **kwargs):
-        """Send a photo, sticker, video, or document."""
-        params = self._get_msg_kwargs(kwargs)
-        caption = kwargs.get(ATTR_CAPTION)
-        func_send = {
-            SERVICE_SEND_PHOTO: self.bot.sendPhoto,
-            SERVICE_SEND_STICKER: self.bot.sendSticker,
-            SERVICE_SEND_VIDEO: self.bot.sendVideo,
-            SERVICE_SEND_DOCUMENT: self.bot.sendDocument,
-        }.get(file_type)
-        file_content = load_data(
-            self.hass,
-            url=kwargs.get(ATTR_URL),
-            filepath=kwargs.get(ATTR_FILE),
-            username=kwargs.get(ATTR_USERNAME),
-            password=kwargs.get(ATTR_PASSWORD),
-            authentication=kwargs.get(ATTR_AUTHENTICATION),
-            verify_ssl=kwargs.get(ATTR_VERIFY_SSL),
-        )
-        if file_content:
-            for chat_id in self._get_target_chat_ids(target):
-                _LOGGER.debug("Send file to chat ID %s. Caption: %s.", chat_id, caption)
-                self._send_msg(
-                    func_send,
-                    "Error sending file",
-                    chat_id,
-                    file_content,
-                    caption=caption,
-                    **params,
+            if config_entry.state is not ConfigEntryState.LOADED:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN,
+                    translation_key="entry_not_loaded",
+                    translation_placeholders={"telegram_bot": config_entry.title},
                 )
-                file_content.seek(0)
-        else:
-            _LOGGER.error("Can't send file with kwargs: %s", kwargs)
 
-    def send_location(self, latitude, longitude, target=None, **kwargs):
-        """Send a location."""
-        latitude = float(latitude)
-        longitude = float(longitude)
-        params = self._get_msg_kwargs(kwargs)
-        for chat_id in self._get_target_chat_ids(target):
-            _LOGGER.debug(
-                "Send location %s/%s to chat ID %s.", latitude, longitude, chat_id
-            )
-            self._send_msg(
-                self.bot.sendLocation,
-                "Error sending location",
-                chat_id=chat_id,
-                latitude=latitude,
-                longitude=longitude,
-                **params,
+            entity_id = entity_registry.async_get_entity_id(
+                "notify",
+                DOMAIN,
+                f"{config_entry.runtime_data.bot.id}_{chat_id}",
             )
 
-    def leave_chat(self, chat_id=None):
-        """Remove bot from chat."""
-        chat_id = self._get_target_chat_ids(chat_id)[0]
-        _LOGGER.debug("Leave from chat ID %s", chat_id)
-        leaved = self._send_msg(self.bot.leaveChat, "Error leaving chat", chat_id)
-        return leaved
-
-
-class BaseTelegramBotEntity:
-    """The base class for the telegram bot."""
-
-    def __init__(self, hass, allowed_chat_ids):
-        """Initialize the bot base class."""
-        self.allowed_chat_ids = allowed_chat_ids
-        self.hass = hass
-
-    def _get_message_data(self, msg_data):
-        """Return boolean msg_data_is_ok and dict msg_data."""
-        if not msg_data:
-            return False, None
-        bad_fields = (
-            "text" not in msg_data and "data" not in msg_data and "chat" not in msg_data
-        )
-        if bad_fields or "from" not in msg_data:
-            # Message is not correct.
-            _LOGGER.error("Incoming message does not have required data (%s)", msg_data)
-            return False, None
-
-        if msg_data["from"].get("id") not in self.allowed_chat_ids or (
-            "chat" in msg_data
-            and msg_data["chat"].get("id") not in self.allowed_chat_ids
-        ):
-            # Origin is not allowed.
-            _LOGGER.error("Incoming message is not allowed (%s)", msg_data)
-            return True, None
-
-        data = {
-            ATTR_USER_ID: msg_data["from"]["id"],
-            ATTR_FROM_FIRST: msg_data["from"]["first_name"],
-        }
-        if "last_name" in msg_data["from"]:
-            data[ATTR_FROM_LAST] = msg_data["from"]["last_name"]
-        if "chat" in msg_data:
-            data[ATTR_CHAT_ID] = msg_data["chat"]["id"]
-        elif ATTR_MESSAGE in msg_data and "chat" in msg_data[ATTR_MESSAGE]:
-            data[ATTR_CHAT_ID] = msg_data[ATTR_MESSAGE]["chat"]["id"]
-
-        return True, data
-
-    def process_message(self, data):
-        """Check for basic message rules and fire an event if message is ok."""
-        if ATTR_MSG in data or ATTR_EDITED_MSG in data:
-            event = EVENT_TELEGRAM_COMMAND
-            if ATTR_MSG in data:
-                data = data.get(ATTR_MSG)
+            if not entity_id:
+                invalid_chat_ids.add(chat_id)
             else:
-                data = data.get(ATTR_EDITED_MSG)
-            message_ok, event_data = self._get_message_data(data)
-            if event_data is None:
-                return message_ok
+                targets.append((config_entry, chat_id, entity_id))
 
-            if "text" in data:
-                if data["text"][0] == "/":
-                    pieces = data["text"].split(" ")
-                    event_data[ATTR_COMMAND] = pieces[0]
-                    event_data[ATTR_ARGS] = pieces[1:]
-                else:
-                    event_data[ATTR_TEXT] = data["text"]
-                    event = EVENT_TELEGRAM_TEXT
-            else:
-                _LOGGER.warning("Message without text data received: %s", data)
-                event_data[ATTR_TEXT] = str(data)
-                event = EVENT_TELEGRAM_TEXT
+        if invalid_chat_ids:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_chat_ids",
+                translation_placeholders={
+                    "chat_ids": ", ".join(str(chat_id) for chat_id in invalid_chat_ids),
+                    "bot_name": config_entry.title,
+                },
+            )
 
-            self.hass.bus.async_fire(event, event_data)
-            return True
-        if ATTR_CALLBACK_QUERY in data:
-            event = EVENT_TELEGRAM_CALLBACK
-            data = data.get(ATTR_CALLBACK_QUERY)
-            message_ok, event_data = self._get_message_data(data)
-            if event_data is None:
-                return message_ok
+    # we're done building targets from service data
+    if targets:
+        return targets
 
-            event_data[ATTR_DATA] = data[ATTR_DATA]
-            event_data[ATTR_MSG] = data[ATTR_MSG]
-            event_data[ATTR_CHAT_INSTANCE] = data[ATTR_CHAT_INSTANCE]
-            event_data[ATTR_MSGID] = data[ATTR_MSGID]
+    # can't determine default since multiple config entries exist
+    raise ServiceValidationError(
+        translation_domain=DOMAIN,
+        translation_key="missing_notify_entities",
+    )
 
-            self.hass.bus.async_fire(event, event_data)
-            return True
 
-        _LOGGER.warning("Message with unknown data received: %s", data)
-        return True
+def _warn_chat_id_migration(service: ServiceCall) -> set[int]:
+    if not service.data.get(ATTR_TARGET):
+        return set()
+
+    chat_ids: set[int] = set(
+        [service.data[ATTR_TARGET]]
+        if isinstance(service.data[ATTR_TARGET], int)
+        else service.data[ATTR_TARGET]
+    )
+
+    # default: service was called using frontend such as developer tools or automation editor
+    service_call_origin = "call_service"
+
+    origin = service.context.origin_event
+    if origin and ATTR_ENTITY_ID in origin.data:
+        # automation
+        service_call_origin = origin.data[ATTR_ENTITY_ID]
+    elif origin and origin.data.get(ATTR_DOMAIN) == SCRIPT_DOMAIN:
+        # script
+        service_call_origin = f"{origin.data[ATTR_DOMAIN]}.{origin.data[ATTR_SERVICE]}"
+
+    ir.async_create_issue(
+        service.hass,
+        DOMAIN,
+        f"migrate_chat_ids_in_target_{service_call_origin}_{service.service}",
+        breaks_in_ha_version="2026.9.0",
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="migrate_chat_ids_in_target",
+        translation_placeholders={
+            "integration_title": "Telegram Bot",
+            "action": f"{DOMAIN}.{service.service}",
+            "chat_ids": ", ".join(str(chat_id) for chat_id in chat_ids),
+            "action_origin": service_call_origin,
+            "telegram_bot_entities_url": "/config/entities?domain=telegram_bot",
+            "example_old": f"```yaml\naction: {service.service}\ndata:\n  target:  # to be updated\n    - 1234567890\n...\n```",
+            "example_new_entity_id": f"```yaml\naction: {service.service}\ndata:\n  entity_id:\n    - notify.telegram_bot_1234567890_1234567890  # replace with your notify entity\n...\n```",
+            "example_new_chat_id": f"```yaml\naction: {service.service}\ndata:\n  chat_id:\n    - 1234567890  # replace with your chat_id\n...\n```",
+        },
+        learn_more_url="https://github.com/home-assistant/core/pull/154868",
+    )
+
+    return chat_ids
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: TelegramBotConfigEntry) -> bool:
+    """Create the Telegram bot from config entry."""
+    bot: Bot = await hass.async_add_executor_job(initialize_bot, hass, entry.data)
+    try:
+        await bot.get_me()
+    except InvalidToken as err:
+        raise ConfigEntryAuthFailed("Invalid API token for Telegram Bot.") from err
+    except TelegramError as err:
+        raise ConfigEntryNotReady from err
+
+    p_type: str = entry.data[CONF_PLATFORM]
+
+    _LOGGER.debug("Setting up %s.%s", DOMAIN, p_type)
+    module = cast(BotPlatformModule, MODULES[p_type])
+    try:
+        receiver_service = await module.async_setup_bot_platform(hass, bot, entry)
+    except Exception:
+        _LOGGER.exception("Error setting up Telegram bot %s", p_type)
+        await bot.shutdown()
+        return False
+
+    notify_service = TelegramNotificationService(
+        hass, receiver_service, bot, entry, entry.options[ATTR_PARSER]
+    )
+    entry.runtime_data = notify_service
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(update_listener))
+
+    return True
+
+
+async def update_listener(hass: HomeAssistant, entry: TelegramBotConfigEntry) -> None:
+    """Handle config changes."""
+    entry.runtime_data.parse_mode = entry.options[ATTR_PARSER]
+
+    # reload entities
+    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: TelegramBotConfigEntry
+) -> bool:
+    """Unload Telegram app."""
+    # broadcast platform has no app
+    if entry.runtime_data.app:
+        await entry.runtime_data.app.shutdown()
+
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

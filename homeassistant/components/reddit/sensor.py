@@ -1,23 +1,36 @@
 """Support for Reddit."""
+
+from __future__ import annotations
+
 from datetime import timedelta
 import logging
+from typing import Any
 
 import praw
 import voluptuous as vol
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_USERNAME, CONF_PASSWORD, CONF_MAXIMUM
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
+from homeassistant.const import (
+    ATTR_ID,
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
+    CONF_MAXIMUM,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_CLIENT_ID = "client_id"
-CONF_CLIENT_SECRET = "client_secret"
 CONF_SORT_BY = "sort_by"
 CONF_SUBREDDITS = "subreddits"
 
-ATTR_ID = "id"
 ATTR_BODY = "body"
 ATTR_COMMENTS_NUMBER = "comms_num"
 ATTR_CREATED = "created"
@@ -35,7 +48,7 @@ LIST_TYPES = ["top", "controversial", "hot", "new"]
 
 SCAN_INTERVAL = timedelta(seconds=300)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_CLIENT_ID): cv.string,
         vol.Required(CONF_CLIENT_SECRET): cv.string,
@@ -50,10 +63,15 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the Reddit sensor platform."""
     subreddits = config[CONF_SUBREDDITS]
-    user_agent = "{}_home_assistant_sensor".format(config[CONF_USERNAME])
+    user_agent = f"{config[CONF_USERNAME]}_home_assistant_sensor"
     limit = config[CONF_MAXIMUM]
     sort_by = config[CONF_SORT_BY]
 
@@ -78,30 +96,24 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     add_entities(sensors, True)
 
 
-class RedditSensor(Entity):
+class RedditSensor(SensorEntity):
     """Representation of a Reddit sensor."""
 
-    def __init__(self, reddit, subreddit: str, limit: int, sort_by: str):
+    _attr_icon = "mdi:reddit"
+
+    def __init__(self, reddit, subreddit: str, limit: int, sort_by: str) -> None:
         """Initialize the Reddit sensor."""
+        self._attr_name = f"reddit_{subreddit}"
+        self._attr_native_value = 0
         self._reddit = reddit
         self._subreddit = subreddit
         self._limit = limit
         self._sort_by = sort_by
 
-        self._subreddit_data = []
+        self._subreddit_data: list = []
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return f"reddit_{self._subreddit}"
-
-    @property
-    def state(self):
-        """Return the state of the sensor."""
-        return len(self._subreddit_data)
-
-    @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
         return {
             ATTR_SUBREDDIT: self._subreddit,
@@ -109,12 +121,7 @@ class RedditSensor(Entity):
             CONF_SORT_BY: self._sort_by,
         }
 
-    @property
-    def icon(self):
-        """Return the icon to use in the frontend."""
-        return "mdi:reddit"
-
-    def update(self):
+    def update(self) -> None:
         """Update data from Reddit API."""
         self._subreddit_data = []
 
@@ -138,3 +145,5 @@ class RedditSensor(Entity):
 
         except praw.exceptions.PRAWException as err:
             _LOGGER.error("Reddit error %s", err)
+
+        self._attr_native_value = len(self._subreddit_data)

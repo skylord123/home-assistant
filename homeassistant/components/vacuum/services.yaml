@@ -1,146 +1,109 @@
 # Describes the format for available vacuum services
 
 turn_on:
-  description: Start a new cleaning task.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.TURN_ON
 
 turn_off:
-  description: Stop the current cleaning task and return to home.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.TURN_OFF
+
+toggle:
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.TURN_OFF
+        - vacuum.VacuumEntityFeature.TURN_ON
 
 stop:
-  description: Stop the current cleaning task.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.STOP
 
 locate:
-  description: Locate the vacuum cleaner robot.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.LOCATE
 
 start_pause:
-  description: Start, pause, or resume the cleaning task.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.PAUSE
 
 start:
-  description: Start or resume the cleaning task.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.START
 
 pause:
-  description: Pause the cleaning task.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.PAUSE
 
 return_to_base:
-  description: Tell the vacuum cleaner to return to its dock.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.RETURN_HOME
 
 clean_spot:
-  description: Tell the vacuum cleaner to do a spot clean-up.
+  target:
+    entity:
+      domain: vacuum
+
+clean_area:
+  target:
+    entity:
+      domain: vacuum
+      supported_features:
+        - vacuum.VacuumEntityFeature.CLEAN_AREA
   fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
+    cleaning_area_id:
+      required: true
+      selector:
+        area:
+          multiple: true
 
 send_command:
-  description: Send a raw command to the vacuum cleaner.
+  target:
+    entity:
+      domain: vacuum
   fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
     command:
-      description: Command to execute.
-      example: 'set_dnd_timer'
+      required: true
+      example: "set_dnd_timer"
+      selector:
+        text:
     params:
-      description: Parameters for the command.
       example: '{ "key": "value" }'
+      selector:
+        object:
 
 set_fan_speed:
-  description: Set the fan speed of the vacuum cleaner.
+  target:
+    entity:
+      domain: vacuum
   fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
     fan_speed:
-      description: Platform dependent vacuum cleaner fan speed, with speed steps, like 'medium' or by percentage, between 0 and 100.
-      example: 'low'
-
-xiaomi_remote_control_start:
-  description: Start remote control of the vacuum cleaner. You can then move it with `remote_control_move`, when done call `remote_control_stop`.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
-
-xiaomi_remote_control_stop:
-  description: Stop remote control mode of the vacuum cleaner.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
-
-xiaomi_remote_control_move:
-  description: Remote control the vacuum cleaner, make sure you first set it in remote control mode with `remote_control_start`.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
-    velocity:
-      description: Speed, between -0.29 and 0.29.
-      example: '0.2'
-    rotation:
-      description: Rotation, between -179 degrees and 179 degrees.
-      example: '90'
-    duration:
-      description: Duration of the movement.
-      example: '1500'
-
-xiaomi_remote_control_move_step:
-  description: Remote control the vacuum cleaner, only makes one move and then stops.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
-    velocity:
-      description: Speed, between -0.29 and 0.29.
-      example: '0.2'
-    rotation:
-      description: Rotation, between -179 degrees and 179 degrees.
-      example: '90'
-    duration:
-      description: Duration of the movement.
-      example: '1500'
-
-xiaomi_clean_zone:
-  description: Start the cleaning operation in the selected areas for the number of repeats indicated.
-  fields:
-    entity_id:
-      description: Name of the vacuum entity.
-      example: 'vacuum.xiaomi_vacuum_cleaner'
-    zone:
-      description: Array of zones. Each zone is an array of 4 integer values.
-      example: '[[23510,25311,25110,26362]]'
-    repeats:
-      description: Number of cleaning repeats for each zone between 1 and 3.
-      example: '1'
+      required: true
+      example: "low"
+      selector:
+        text:

@@ -1,25 +1,32 @@
 {
-    "config": {
-        "title": "Certificate Expiry",
-        "step": {
-            "user": {
-                "title": "Define the certificate to test",
-                "data": {
-                    "name": "The name of the certificate",
-                    "host": "The hostname of the certificate",
-                    "port": "The port of the certificate"
-                }
-            }
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]",
+      "import_failed": "Import from config failed"
+    },
+    "error": {
+      "connection_refused": "Connection refused when connecting to host",
+      "connection_reset": "Connection reset when connecting to host",
+      "connection_timeout": "Timeout when connecting to this host",
+      "resolve_failed": "This host cannot be resolved"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "name": "The name of the certificate",
+          "port": "[%key:common::config_flow::data::port%]"
         },
-        "error": {
-            "host_port_exists": "This host and port combination is already configured",
-            "resolve_failed": "This host can not be resolved",
-            "connection_timeout": "Timeout when connecting to this host",
-            "certificate_error": "Certificate could not be validated",
-            "wrong_host": "Certificate does not match hostname"
-        },
-        "abort": {
-            "host_port_exists": "This host and port combination is already configured"
-        }
+        "title": "Define the certificate to test"
+      }
     }
+  },
+  "entity": {
+    "sensor": {
+      "certificate_expiry": {
+        "name": "Cert expiry"
+      }
+    }
+  },
+  "title": "Certificate Expiry"
 }

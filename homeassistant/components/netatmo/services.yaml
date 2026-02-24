@@ -1,30 +1,123 @@
-addwebhook:
-  description: Add webhook during runtime (e.g. if it has been banned).
+# Describes the format for available Netatmo services
+set_camera_light:
+  target:
+    entity:
+      integration: netatmo
+      domain: light
   fields:
-    url:
-      description: URL for which to add the webhook.
-      example: https://yourdomain.com:443/api/webhook/webhook_id
+    camera_light_mode:
+      required: true
+      selector:
+        select:
+          options:
+            - "on"
+            - "off"
+            - "auto"
 
-dropwebhook:
-  description: Drop active webhooks.
-
-set_light_auto:
-  description: Set the camera (Presence only) light in automatic mode.
+set_schedule:
+  target:
+    entity:
+      integration: netatmo
+      domain: climate
   fields:
-    entity_id:
-      description: Entity id.
-      example: 'camera.living_room'
+    schedule_name:
+      example: Standard
+      required: true
+      selector:
+        text:
 
-set_light_on:
-  description: Set the camera (Netatmo Presence only) light on.
+set_preset_mode_with_end_datetime:
+  target:
+    entity:
+      integration: netatmo
+      domain: climate
   fields:
-    entity_id:
-      description: Entity id.
-      example: 'camera.living_room'
+    preset_mode:
+      required: true
+      example: "away"
+      selector:
+        select:
+          options:
+            - "away"
+            - "frost_guard"
+    end_datetime:
+      required: true
+      example: '"2019-04-20 05:04:20"'
+      selector:
+        datetime:
 
-set_light_off:
-  description: Set the camera (Netatmo Presence only) light off.
+set_temperature_with_end_datetime:
+  target:
+    entity:
+      integration: netatmo
+      domain: climate
   fields:
-    entity_id:
-      description: Entity id.
-      example: 'camera.living_room'
+    target_temperature:
+      required: true
+      example: "19.5"
+      selector:
+        number:
+          min: 7
+          max: 30
+          step: 0.5
+    end_datetime:
+      required: true
+      example: '"2019-04-20 05:04:20"'
+      selector:
+        datetime:
+
+set_temperature_with_time_period:
+  target:
+    entity:
+      integration: netatmo
+      domain: climate
+  fields:
+    target_temperature:
+      required: true
+      example: "19.5"
+      selector:
+        number:
+          min: 7
+          max: 30
+          step: 0.5
+    time_period:
+      required: true
+      default:
+        hours: 3
+        minutes: 0
+        seconds: 0
+        days: 0
+      selector:
+        duration:
+
+clear_temperature_setting:
+  target:
+    entity:
+      integration: netatmo
+      domain: climate
+
+set_persons_home:
+  target:
+    entity:
+      integration: netatmo
+      domain: camera
+  fields:
+    persons:
+      example: "[Alice, Bob]"
+      required: true
+      selector:
+        object:
+
+set_person_away:
+  target:
+    entity:
+      integration: netatmo
+      domain: camera
+  fields:
+    person:
+      example: Bob
+      selector:
+        text:
+
+register_webhook:
+unregister_webhook:

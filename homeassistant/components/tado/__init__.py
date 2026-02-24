@@ -1,145 +1,155 @@
 """Support for the (unofficial) Tado API."""
+
 from datetime import timedelta
 import logging
-import urllib
 
+import PyTado
+import PyTado.exceptions
 from PyTado.interface import Tado
-import voluptuous as vol
 
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.discovery import load_platform
-from homeassistant.util import Throttle
+from homeassistant.const import (
+    APPLICATION_NAME,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    Platform,
+    __version__ as HA_VERSION,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.typing import ConfigType
+
+from .const import (
+    CONF_FALLBACK,
+    CONF_REFRESH_TOKEN,
+    CONST_OVERLAY_MANUAL,
+    CONST_OVERLAY_TADO_DEFAULT,
+    CONST_OVERLAY_TADO_MODE,
+    CONST_OVERLAY_TADO_OPTIONS,
+    DOMAIN,
+    TADO_BRIDGE_MODELS,
+)
+from .coordinator import TadoConfigEntry, TadoDataUpdateCoordinator
+from .services import async_setup_services
+
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.CLIMATE,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.WATER_HEATER,
+]
+
+MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=4)
+SCAN_INTERVAL = timedelta(minutes=5)
+SCAN_MOBILE_DEVICE_INTERVAL = timedelta(seconds=30)
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_TADO = "tado_data"
-DOMAIN = "tado"
 
-MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=10)
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up Tado."""
 
-TADO_COMPONENTS = ["sensor", "climate"]
+    async_setup_services(hass)
+    return True
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_USERNAME): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
-            }
+
+async def async_setup_entry(hass: HomeAssistant, entry: TadoConfigEntry) -> bool:
+    """Set up Tado from a config entry."""
+    if CONF_REFRESH_TOKEN not in entry.data:
+        raise ConfigEntryAuthFailed
+
+    _async_import_options_from_data_if_missing(hass, entry)
+
+    _LOGGER.debug("Setting up Tado connection")
+    _LOGGER.debug(
+        "Creating tado instance with refresh token: %s",
+        entry.data[CONF_REFRESH_TOKEN],
+    )
+
+    def create_tado_instance() -> tuple[Tado, str]:
+        """Create a Tado instance, this time with a previously obtained refresh token."""
+        tado = Tado(
+            saved_refresh_token=entry.data[CONF_REFRESH_TOKEN],
+            user_agent=f"{APPLICATION_NAME}/{HA_VERSION}",
         )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-
-def setup(hass, config):
-    """Set up of the Tado component."""
-    username = config[DOMAIN][CONF_USERNAME]
-    password = config[DOMAIN][CONF_PASSWORD]
+        return tado, tado.device_activation_status()
 
     try:
-        tado = Tado(username, password)
-        tado.setDebugging(True)
-    except (RuntimeError, urllib.error.HTTPError):
-        _LOGGER.error("Unable to connect to mytado with username and password")
-        return False
+        tado, device_status = await hass.async_add_executor_job(create_tado_instance)
+    except PyTado.exceptions.TadoWrongCredentialsException as err:
+        raise ConfigEntryError(f"Invalid Tado credentials. Error: {err}") from err
+    except PyTado.exceptions.TadoException as err:
+        raise ConfigEntryNotReady(f"Error during Tado setup: {err}") from err
+    if device_status != "COMPLETED":
+        raise ConfigEntryAuthFailed(
+            f"Device login flow status is {device_status}. Starting re-authentication."
+        )
 
-    hass.data[DATA_TADO] = TadoDataStore(tado)
+    _LOGGER.debug("Tado connection established")
 
-    for component in TADO_COMPONENTS:
-        load_platform(hass, component, DOMAIN, {}, config)
+    coordinator = TadoDataUpdateCoordinator(hass, entry, tado)
+    await coordinator.async_config_entry_first_refresh()
+
+    # Pre-register the bridge device to ensure it exists before other devices reference it
+    device_registry = dr.async_get(hass)
+    for device in coordinator.data["device"].values():
+        if device["deviceType"] in TADO_BRIDGE_MODELS:
+            _LOGGER.debug("Pre-registering Tado bridge: %s", device["shortSerialNo"])
+            device_registry.async_get_or_create(
+                config_entry_id=entry.entry_id,
+                identifiers={(DOMAIN, device["shortSerialNo"])},
+                manufacturer="Tado",
+                model=device["deviceType"],
+                name=device["serialNo"],
+                sw_version=device["currentFwVersion"],
+                configuration_url=f"https://app.tado.com/en/main/settings/rooms-and-devices/device/{device['serialNo']}",
+            )
+
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-class TadoDataStore:
-    """An object to store the Tado data."""
+async def async_migrate_entry(hass: HomeAssistant, entry: TadoConfigEntry) -> bool:
+    """Migrate old entry."""
 
-    def __init__(self, tado):
-        """Initialize Tado data store."""
-        self.tado = tado
+    if entry.version < 2:
+        _LOGGER.debug("Migrating Tado entry to version 2. Current data: %s", entry.data)
+        data = dict(entry.data)
+        data.pop(CONF_USERNAME, None)
+        data.pop(CONF_PASSWORD, None)
+        hass.config_entries.async_update_entry(entry=entry, data=data, version=2)
+        _LOGGER.debug("Migration to version 2 successful")
+    return True
 
-        self.sensors = {}
-        self.data = {}
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def update(self):
-        """Update the internal data from mytado.com."""
-        for data_id, sensor in list(self.sensors.items()):
-            data = None
-
-            try:
-                if "zone" in sensor:
-                    _LOGGER.debug(
-                        "Querying mytado.com for zone %s %s",
-                        sensor["id"],
-                        sensor["name"],
-                    )
-                    data = self.tado.getState(sensor["id"])
-
-                if "device" in sensor:
-                    _LOGGER.debug(
-                        "Querying mytado.com for device %s %s",
-                        sensor["id"],
-                        sensor["name"],
-                    )
-                    data = self.tado.getDevices()[0]
-
-            except RuntimeError:
-                _LOGGER.error(
-                    "Unable to connect to myTado. %s %s", sensor["id"], sensor["id"]
-                )
-
-            self.data[data_id] = data
-
-    def add_sensor(self, data_id, sensor):
-        """Add a sensor to update in _update()."""
-        self.sensors[data_id] = sensor
-        self.data[data_id] = None
-
-    def get_data(self, data_id):
-        """Get the cached data."""
-        data = {"error": "no data"}
-
-        if data_id in self.data:
-            data = self.data[data_id]
-
-        return data
-
-    def get_zones(self):
-        """Wrap for getZones()."""
-        return self.tado.getZones()
-
-    def get_capabilities(self, tado_id):
-        """Wrap for getCapabilities(..)."""
-        return self.tado.getCapabilities(tado_id)
-
-    def get_me(self):
-        """Wrap for getMe()."""
-        return self.tado.getMe()
-
-    def reset_zone_overlay(self, zone_id):
-        """Wrap for resetZoneOverlay(..)."""
-        self.tado.resetZoneOverlay(zone_id)
-        self.update(no_throttle=True)  # pylint: disable=unexpected-keyword-arg
-
-    def set_zone_overlay(
-        self,
-        zone_id,
-        overlay_mode,
-        temperature=None,
-        duration=None,
-        device_type="HEATING",
-        mode=None,
-    ):
-        """Wrap for setZoneOverlay(..)."""
-        self.tado.setZoneOverlay(
-            zone_id, overlay_mode, temperature, duration, device_type, "ON", mode
+@callback
+def _async_import_options_from_data_if_missing(
+    hass: HomeAssistant, entry: TadoConfigEntry
+):
+    options = dict(entry.options)
+    if CONF_FALLBACK not in options:
+        options[CONF_FALLBACK] = entry.data.get(
+            CONF_FALLBACK, CONST_OVERLAY_TADO_DEFAULT
         )
-        self.update(no_throttle=True)  # pylint: disable=unexpected-keyword-arg
+        hass.config_entries.async_update_entry(entry, options=options)
 
-    def set_zone_off(self, zone_id, overlay_mode, device_type="HEATING"):
-        """Set a zone to off."""
-        self.tado.setZoneOverlay(zone_id, overlay_mode, None, None, device_type, "OFF")
-        self.update(no_throttle=True)  # pylint: disable=unexpected-keyword-arg
+    if options[CONF_FALLBACK] not in CONST_OVERLAY_TADO_OPTIONS:
+        if options[CONF_FALLBACK]:
+            options[CONF_FALLBACK] = CONST_OVERLAY_TADO_MODE
+        else:
+            options[CONF_FALLBACK] = CONST_OVERLAY_MANUAL
+        hass.config_entries.async_update_entry(entry, options=options)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: TadoConfigEntry) -> bool:
+    """Unload a config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

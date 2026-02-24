@@ -1,22 +1,29 @@
 """Pushsafer platform for notify component."""
+
+from __future__ import annotations
+
 import base64
+from http import HTTPStatus
 import logging
 import mimetypes
+from typing import Any
 
 import requests
 from requests.auth import HTTPBasicAuth
 import voluptuous as vol
-
-import homeassistant.helpers.config_validation as cv
 
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TARGET,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
+from homeassistant.const import ATTR_ICON
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 _RESOURCE = "https://www.pushsafer.com/api"
@@ -28,7 +35,6 @@ CONF_TIMEOUT = 15
 # Top level attributes in 'data'
 ATTR_SOUND = "sound"
 ATTR_VIBRATION = "vibration"
-ATTR_ICON = "icon"
 ATTR_ICONCOLOR = "iconcolor"
 ATTR_URL = "url"
 ATTR_URLTITLE = "urltitle"
@@ -36,7 +42,10 @@ ATTR_TIME2LIVE = "time2live"
 ATTR_PRIORITY = "priority"
 ATTR_RETRY = "retry"
 ATTR_EXPIRE = "expire"
+ATTR_CONFIRM = "confirm"
 ATTR_ANSWER = "answer"
+ATTR_ANSWEROPTIONS = "answeroptions"
+ATTR_ANSWERFORCE = "answerforce"
 ATTR_PICTURE1 = "picture1"
 
 # Attributes contained in picture1
@@ -46,35 +55,38 @@ ATTR_PICTURE1_USERNAME = "username"
 ATTR_PICTURE1_PASSWORD = "password"
 ATTR_PICTURE1_AUTH = "auth"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({vol.Required(CONF_DEVICE_KEY): cv.string})
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
+    {vol.Required(CONF_DEVICE_KEY): cv.string}
+)
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> PushsaferNotificationService:
     """Get the Pushsafer.com notification service."""
-    return PushsaferNotificationService(
-        config.get(CONF_DEVICE_KEY), hass.config.is_allowed_path
-    )
+    return PushsaferNotificationService(config[CONF_DEVICE_KEY])
 
 
 class PushsaferNotificationService(BaseNotificationService):
     """Implementation of the notification service for Pushsafer.com."""
 
-    def __init__(self, private_key, is_allowed_path):
+    def __init__(self, private_key: str) -> None:
         """Initialize the service."""
         self._private_key = private_key
-        self.is_allowed_path = is_allowed_path
 
-    def send_message(self, message="", **kwargs):
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to specified target."""
-        if kwargs.get(ATTR_TARGET) is None:
+        targets: list[str] | None
+        if (targets := kwargs.get(ATTR_TARGET)) is None:
             targets = ["a"]
             _LOGGER.debug("No target specified. Sending push to all")
         else:
-            targets = kwargs.get(ATTR_TARGET)
             _LOGGER.debug("%s target(s) specified", len(targets))
 
         title = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
-        data = kwargs.get(ATTR_DATA, {})
+        data = kwargs.get(ATTR_DATA) or {}
 
         # Converting the specified image to base64
         picture1 = data.get(ATTR_PICTURE1)
@@ -94,7 +106,7 @@ class PushsaferNotificationService(BaseNotificationService):
                 _LOGGER.debug("Loading image from file %s", local_path)
                 picture1_encoded = self.load_from_file(local_path)
             else:
-                _LOGGER.warning("missing url or local_path for picture1")
+                _LOGGER.warning("Missing url or local_path for picture1")
         else:
             _LOGGER.debug("picture1 is not specified")
 
@@ -112,14 +124,17 @@ class PushsaferNotificationService(BaseNotificationService):
             "pr": data.get(ATTR_PRIORITY, ""),
             "re": data.get(ATTR_RETRY, ""),
             "ex": data.get(ATTR_EXPIRE, ""),
+            "cr": data.get(ATTR_CONFIRM, ""),
             "a": data.get(ATTR_ANSWER, ""),
+            "ao": data.get(ATTR_ANSWEROPTIONS, ""),
+            "af": data.get(ATTR_ANSWERFORCE, ""),
             "p": picture1_encoded,
         }
 
         for target in targets:
             payload["d"] = target
             response = requests.post(_RESOURCE, data=payload, timeout=CONF_TIMEOUT)
-            if response.status_code != 200:
+            if response.status_code != HTTPStatus.OK:
                 _LOGGER.error("Pushsafer failed with: %s", response.text)
             else:
                 _LOGGER.debug("Push send: %s", response.json())
@@ -144,7 +159,7 @@ class PushsaferNotificationService(BaseNotificationService):
             else:
                 response = requests.get(url, timeout=CONF_TIMEOUT)
             return self.get_base64(response.content, response.headers["content-type"])
-        _LOGGER.warning("url not found in param")
+        _LOGGER.warning("No url was found in param")
 
         return None
 
@@ -153,7 +168,7 @@ class PushsaferNotificationService(BaseNotificationService):
         try:
             if local_path is not None:
                 _LOGGER.debug("Loading image from local path")
-                if self.is_allowed_path(local_path):
+                if self.hass.config.is_allowed_path(local_path):
                     file_mimetype = mimetypes.guess_type(local_path)
                     _LOGGER.debug("Detected mimetype %s", file_mimetype)
                     with open(local_path, "rb") as binary_file:

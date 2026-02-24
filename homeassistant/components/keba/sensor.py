@@ -1,16 +1,27 @@
 """Support for KEBA charging station sensors."""
-import logging
 
-from homeassistant.const import ENERGY_KILO_WATT_HOUR
-from homeassistant.helpers.entity import Entity
-from homeassistant.const import DEVICE_CLASS_POWER
+from __future__ import annotations
 
-from . import DOMAIN
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.const import UnitOfElectricCurrent, UnitOfEnergy, UnitOfPower
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-_LOGGER = logging.getLogger(__name__)
+from . import DOMAIN, KebaHandler
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the KEBA charging station platform."""
     if discovery_info is None:
         return
@@ -18,78 +29,92 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     keba = hass.data[DOMAIN]
 
     sensors = [
-        KebaSensor(keba, "Curr user", "Max current", "mdi:flash", "A"),
         KebaSensor(
-            keba, "Setenergy", "Energy target", "mdi:gauge", ENERGY_KILO_WATT_HOUR
+            keba,
+            "max_current",
+            SensorEntityDescription(
+                key="Curr user",
+                name="Max Current",
+                native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+                device_class=SensorDeviceClass.CURRENT,
+            ),
         ),
-        KebaSensor(keba, "P", "Charging power", "mdi:flash", "kW", DEVICE_CLASS_POWER),
         KebaSensor(
-            keba, "E pres", "Session energy", "mdi:gauge", ENERGY_KILO_WATT_HOUR
+            keba,
+            "energy_target",
+            SensorEntityDescription(
+                key="Setenergy",
+                name="Energy Target",
+                native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                device_class=SensorDeviceClass.ENERGY,
+            ),
         ),
-        KebaSensor(keba, "E total", "Total Energy", "mdi:gauge", ENERGY_KILO_WATT_HOUR),
+        KebaSensor(
+            keba,
+            "charging_power",
+            SensorEntityDescription(
+                key="P",
+                name="Charging Power",
+                native_unit_of_measurement=UnitOfPower.KILO_WATT,
+                device_class=SensorDeviceClass.POWER,
+                state_class=SensorStateClass.MEASUREMENT,
+            ),
+        ),
+        KebaSensor(
+            keba,
+            "session_energy",
+            SensorEntityDescription(
+                key="E pres",  # codespell:ignore pres
+                name="Session Energy",
+                native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                device_class=SensorDeviceClass.ENERGY,
+            ),
+        ),
+        KebaSensor(
+            keba,
+            "total_energy",
+            SensorEntityDescription(
+                key="E total",
+                name="Total Energy",
+                native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                device_class=SensorDeviceClass.ENERGY,
+                state_class=SensorStateClass.TOTAL_INCREASING,
+            ),
+        ),
     ]
     async_add_entities(sensors)
 
 
-class KebaSensor(Entity):
+class KebaSensor(SensorEntity):
     """The entity class for KEBA charging stations sensors."""
 
-    def __init__(self, keba, key, name, icon, unit, device_class=None):
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        keba: KebaHandler,
+        entity_type: str,
+        description: SensorEntityDescription,
+    ) -> None:
         """Initialize the KEBA Sensor."""
-        self._key = key
         self._keba = keba
-        self._name = name
-        self._device_class = device_class
-        self._icon = icon
-        self._unit = unit
-        self._state = None
-        self._attributes = {}
+        self.entity_description = description
+
+        self._attr_name = f"{keba.device_name} {description.name}"
+        self._attr_unique_id = f"{keba.device_id}_{entity_type}"
+
+        self._attributes: dict[str, str] = {}
 
     @property
-    def should_poll(self):
-        """Deactivate polling. Data updated by KebaHandler."""
-        return False
-
-    @property
-    def unique_id(self):
-        """Return the unique ID of the binary sensor."""
-        return f"{self._keba.device_name}_{self._name}"
-
-    @property
-    def name(self):
-        """Return the name of the device."""
-        return self._name
-
-    @property
-    def device_class(self):
-        """Return the class of this sensor."""
-        return self._device_class
-
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return self._icon
-
-    @property
-    def state(self):
-        """Return the state of the sensor."""
-        return self._state
-
-    @property
-    def unit_of_measurement(self):
-        """Get the unit of measurement."""
-        return self._unit
-
-    @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, str]:
         """Return the state attributes of the binary sensor."""
         return self._attributes
 
-    async def async_update(self):
+    async def async_update(self) -> None:
         """Get latest cached states from the device."""
-        self._state = self._keba.get_value(self._key)
+        self._attr_native_value = self._keba.get_value(self.entity_description.key)
 
-        if self._key == "P":
+        if self.entity_description.key == "P":
             self._attributes["power_factor"] = self._keba.get_value("PF")
             self._attributes["voltage_u1"] = str(self._keba.get_value("U1"))
             self._attributes["voltage_u2"] = str(self._keba.get_value("U2"))
@@ -97,13 +122,13 @@ class KebaSensor(Entity):
             self._attributes["current_i1"] = str(self._keba.get_value("I1"))
             self._attributes["current_i2"] = str(self._keba.get_value("I2"))
             self._attributes["current_i3"] = str(self._keba.get_value("I3"))
-        elif self._key == "Curr user":
+        elif self.entity_description.key == "Curr user":
             self._attributes["max_current_hardware"] = self._keba.get_value("Curr HW")
 
-    def update_callback(self):
+    def update_callback(self) -> None:
         """Schedule a state update."""
         self.async_schedule_update_ha_state(True)
 
-    async def async_added_to_hass(self):
+    async def async_added_to_hass(self) -> None:
         """Add update callback after being added to hass."""
         self._keba.add_update_listener(self.update_callback)

@@ -1,25 +1,11 @@
 """Constants for the Coolmaster integration."""
 
-from homeassistant.components.climate.const import (
-    HVAC_MODE_COOL,
-    HVAC_MODE_DRY,
-    HVAC_MODE_FAN_ONLY,
-    HVAC_MODE_HEAT,
-    HVAC_MODE_HEAT_COOL,
-    HVAC_MODE_OFF,
-)
-
 DOMAIN = "coolmaster"
 
 DEFAULT_PORT = 10102
 
 CONF_SUPPORTED_MODES = "supported_modes"
-
-AVAILABLE_MODES = [
-    HVAC_MODE_OFF,
-    HVAC_MODE_HEAT,
-    HVAC_MODE_COOL,
-    HVAC_MODE_DRY,
-    HVAC_MODE_HEAT_COOL,
-    HVAC_MODE_FAN_ONLY,
-]
+CONF_SWING_SUPPORT = "swing_support"
+CONF_SEND_WAKEUP_PROMPT = "send_wakeup_prompt"
+MAX_RETRIES = 3
+BACKOFF_BASE_DELAY = 2

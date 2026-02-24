@@ -1,18 +1,22 @@
 """Support for Dovado router."""
-import logging
-from datetime import timedelta
 
-import dovado
+# mypy: ignore-errors
+from datetime import timedelta
+import logging
+
+# import dovado
 import voluptuous as vol
 
-import homeassistant.helpers.config_validation as cv
 from homeassistant.const import (
-    CONF_USERNAME,
-    CONF_PASSWORD,
     CONF_HOST,
+    CONF_PASSWORD,
     CONF_PORT,
+    CONF_USERNAME,
     DEVICE_DEFAULT_NAME,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import Throttle
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,13 +40,13 @@ CONFIG_SCHEMA = vol.Schema(
 MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=30)
 
 
-def setup(hass, config):
+def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Dovado component."""
 
     hass.data[DOMAIN] = DovadoData(
         dovado.Dovado(
-            config[DOMAIN].get(CONF_USERNAME),
-            config[DOMAIN].get(CONF_PASSWORD),
+            config[DOMAIN][CONF_USERNAME],
+            config[DOMAIN][CONF_PASSWORD],
             config[DOMAIN].get(CONF_HOST),
             config[DOMAIN].get(CONF_PORT),
         )
@@ -71,10 +75,11 @@ class DovadoData:
             if not self.state:
                 return False
             self.state.update(connected=self.state.get("modem status") == "CONNECTED")
-            _LOGGER.debug("Received: %s", self.state)
-            return True
         except OSError as error:
             _LOGGER.warning("Could not contact the router: %s", error)
+            return None
+        _LOGGER.debug("Received: %s", self.state)
+        return True
 
     @property
     def client(self):

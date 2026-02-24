@@ -1,10 +1,12 @@
 {
   "domain": "iss",
-  "name": "Iss",
+  "name": "International Space Station (ISS)",
+  "codeowners": ["@DurgNomis-drol"],
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/iss",
-  "requirements": [
-    "pyiss==1.0.1"
-  ],
-  "dependencies": [],
-  "codeowners": []
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["pyiss"],
+  "requirements": ["pyiss==1.0.1"],
+  "single_config_entry": true
 }

@@ -1,11 +1,21 @@
 """Kodi notification service."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 import aiohttp
 import jsonrpc_async
-
 import voluptuous as vol
 
+from homeassistant.components.notify import (
+    ATTR_DATA,
+    ATTR_TITLE,
+    ATTR_TITLE_DEFAULT,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
+    BaseNotificationService,
+)
 from homeassistant.const import (
     ATTR_ICON,
     CONF_HOST,
@@ -14,16 +24,10 @@ from homeassistant.const import (
     CONF_PROXY_SSL,
     CONF_USERNAME,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
-
-from homeassistant.components.notify import (
-    ATTR_DATA,
-    ATTR_TITLE,
-    ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
-    BaseNotificationService,
-)
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ DEFAULT_PORT = 8080
 DEFAULT_PROXY_SSL = False
 DEFAULT_TIMEOUT = 5
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_HOST): cv.string,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
@@ -44,29 +48,31 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 ATTR_DISPLAYTIME = "displaytime"
 
 
-async def async_get_service(hass, config, discovery_info=None):
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> KodiNotificationService:
     """Return the notify service."""
-    url = "{}:{}".format(config.get(CONF_HOST), config.get(CONF_PORT))
+    username: str | None = config.get(CONF_USERNAME)
+    password: str | None = config.get(CONF_PASSWORD)
 
-    username = config.get(CONF_USERNAME)
-    password = config.get(CONF_PASSWORD)
-
-    host = config.get(CONF_HOST)
-    port = config.get(CONF_PORT)
+    host: str = config[CONF_HOST]
+    port: int = config[CONF_PORT]
     encryption = config.get(CONF_PROXY_SSL)
 
-    if host.startswith("http://") or host.startswith("https://"):
+    if host.startswith(("http://", "https://")):
         host = host[host.index("://") + 3 :]
         _LOGGER.warning(
             "Kodi host name should no longer contain http:// See updated "
             "definitions here: "
-            "https://home-assistant.io/components/media_player.kodi/"
+            "https://www.home-assistant.io/integrations/kodi/"
         )
 
     http_protocol = "https" if encryption else "http"
     url = f"{http_protocol}://{host}:{port}/jsonrpc"
 
-    if username is not None:
+    if username is not None and password is not None:
         auth = aiohttp.BasicAuth(username, password)
     else:
         auth = None
@@ -88,7 +94,7 @@ class KodiNotificationService(BaseNotificationService):
 
         self._server = jsonrpc_async.Server(self._url, **kwargs)
 
-    async def async_send_message(self, message="", **kwargs):
+    async def async_send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to Kodi."""
         try:
             data = kwargs.get(ATTR_DATA) or {}

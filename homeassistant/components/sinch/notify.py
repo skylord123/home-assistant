@@ -1,25 +1,31 @@
 """Support for Sinch notifications."""
-import logging
 
-import voluptuous as vol
+from __future__ import annotations
+
+import logging
+from typing import Any
+
 from clx.xms.api import MtBatchTextSmsResult
 from clx.xms.client import Client
 from clx.xms.exceptions import (
     ErrorResponseException,
-    UnexpectedResponseException,
-    UnauthorizedException,
     NotFoundException,
+    UnauthorizedException,
+    UnexpectedResponseException,
 )
+import voluptuous as vol
 
-import homeassistant.helpers.config_validation as cv
 from homeassistant.components.notify import (
-    ATTR_MESSAGE,
     ATTR_DATA,
+    ATTR_MESSAGE,
     ATTR_TARGET,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
 from homeassistant.const import CONF_API_KEY, CONF_SENDER
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 DOMAIN = "sinch"
 
@@ -32,7 +38,7 @@ DEFAULT_SENDER = "Home Assistant"
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_API_KEY): cv.string,
         vol.Required(CONF_SERVICE_PLAN_ID): cv.string,
@@ -44,7 +50,11 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> SinchNotificationService:
     """Get the Sinch notification service."""
     return SinchNotificationService(config)
 
@@ -58,7 +68,7 @@ class SinchNotificationService(BaseNotificationService):
         self.sender = config[CONF_SENDER]
         self.client = Client(config[CONF_SERVICE_PLAN_ID], config[CONF_API_KEY])
 
-    def send_message(self, message="", **kwargs):
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to a user."""
         targets = kwargs.get(ATTR_TARGET, self.default_recipients)
         data = kwargs.get(ATTR_DATA) or {}
@@ -83,7 +93,7 @@ class SinchNotificationService(BaseNotificationService):
                 )
         except ErrorResponseException as ex:
             _LOGGER.error(
-                "Caught ErrorResponseException. Response code: %d (%s)",
+                "Caught ErrorResponseException. Response code: %s (%s)",
                 ex.error_code,
                 ex,
             )

@@ -1,10 +1,11 @@
 {
   "domain": "namecheapdns",
-  "name": "Namecheapdns",
+  "name": "Namecheap DynamicDNS",
+  "codeowners": ["@tr4nt0r"],
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/namecheapdns",
-  "requirements": [
-    "defusedxml==0.6.0"
-  ],
-  "dependencies": [],
-  "codeowners": []
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "quality_scale": "platinum",
+  "requirements": []
 }

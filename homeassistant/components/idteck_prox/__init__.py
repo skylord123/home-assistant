@@ -1,15 +1,21 @@
 """Component for interfacing RFK101 proximity card readers."""
+
+from __future__ import annotations
+
 import logging
 
+from rfk101py.rfk101py import rfk101py
 import voluptuous as vol
 
-import homeassistant.helpers.config_validation as cv
 from homeassistant.const import (
     CONF_HOST,
-    CONF_PORT,
     CONF_NAME,
+    CONF_PORT,
     EVENT_HOMEASSISTANT_STOP,
 )
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +42,7 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-def setup(hass, config):
+def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the IDTECK proximity card component."""
     conf = config[DOMAIN]
     for unit in conf:
@@ -68,17 +74,16 @@ class IdteckReader:
 
     def connect(self):
         """Connect to the reader."""
-        from rfk101py.rfk101py import rfk101py
 
         self._connection = rfk101py(self._host, self._port, self._callback)
 
     def _callback(self, card):
-        """Send a keycard event message into HASS whenever a card is read."""
+        """Send a keycard event message into Home Assistant whenever a card is read."""
         self.hass.bus.fire(
             EVENT_IDTECK_PROX_KEYCARD, {"card": card, "name": self._name}
         )
 
-    def stop(self):
+    def stop(self, _: Event) -> None:
         """Close resources."""
         if self._connection:
             self._connection.close()

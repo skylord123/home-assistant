@@ -1,24 +1,29 @@
 """SendGrid notification service."""
-import logging
 
-import voluptuous as vol
+from __future__ import annotations
+
+from http import HTTPStatus
+import logging
+from typing import Any
 
 from sendgrid import SendGridAPIClient
+import voluptuous as vol
 
+from homeassistant.components.notify import (
+    ATTR_TITLE,
+    ATTR_TITLE_DEFAULT,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
+    BaseNotificationService,
+)
 from homeassistant.const import (
     CONF_API_KEY,
     CONF_RECIPIENT,
     CONF_SENDER,
     CONTENT_TYPE_TEXT_PLAIN,
 )
-import homeassistant.helpers.config_validation as cv
-
-from homeassistant.components.notify import (
-    ATTR_TITLE,
-    ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
-    BaseNotificationService,
-)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,8 +31,7 @@ CONF_SENDER_NAME = "sender_name"
 
 DEFAULT_SENDER_NAME = "Home Assistant"
 
-# pylint: disable=no-value-for-parameter
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_API_KEY): cv.string,
         vol.Required(CONF_SENDER): vol.Email(),
@@ -37,7 +41,11 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> SendgridNotificationService:
     """Get the SendGrid notification service."""
     return SendgridNotificationService(config)
 
@@ -54,7 +62,7 @@ class SendgridNotificationService(BaseNotificationService):
 
         self._sg = SendGridAPIClient(self.api_key)
 
-    def send_message(self, message="", **kwargs):
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send an email to a user via SendGrid."""
         subject = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
 
@@ -67,5 +75,5 @@ class SendgridNotificationService(BaseNotificationService):
         }
 
         response = self._sg.client.mail.send.post(request_body=data)
-        if response.status_code != 202:
+        if response.status_code != HTTPStatus.ACCEPTED:
             _LOGGER.error("Unable to send notification")

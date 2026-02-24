@@ -1,20 +1,30 @@
 """Support for customised Kankun SP3 Wifi switch."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 import requests
 import voluptuous as vol
 
-from homeassistant.components.switch import SwitchDevice, PLATFORM_SCHEMA
+from homeassistant.components.switch import (
+    PLATFORM_SCHEMA as SWITCH_PLATFORM_SCHEMA,
+    SwitchEntity,
+)
 from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
-    CONF_PORT,
-    CONF_PATH,
-    CONF_USERNAME,
     CONF_PASSWORD,
+    CONF_PATH,
+    CONF_PORT,
     CONF_SWITCHES,
+    CONF_USERNAME,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,12 +42,17 @@ SWITCH_SCHEMA = vol.Schema(
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SWITCH_PLATFORM_SCHEMA.extend(
     {vol.Required(CONF_SWITCHES): cv.schema_with_slug_keys(SWITCH_SCHEMA)}
 )
 
 
-def setup_platform(hass, config, add_entities_callback, discovery_info=None):
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities_callback: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up Kankun Wifi switches."""
     switches = config.get("switches", {})
     devices = []
@@ -47,10 +62,10 @@ def setup_platform(hass, config, add_entities_callback, discovery_info=None):
             KankunSwitch(
                 hass,
                 properties.get(CONF_NAME, dev_name),
-                properties.get(CONF_HOST, None),
+                properties.get(CONF_HOST),
                 properties.get(CONF_PORT, DEFAULT_PORT),
                 properties.get(CONF_PATH, DEFAULT_PATH),
-                properties.get(CONF_USERNAME, None),
+                properties.get(CONF_USERNAME),
                 properties.get(CONF_PASSWORD),
             )
         )
@@ -58,14 +73,14 @@ def setup_platform(hass, config, add_entities_callback, discovery_info=None):
     add_entities_callback(devices)
 
 
-class KankunSwitch(SwitchDevice):
+class KankunSwitch(SwitchEntity):
     """Representation of a Kankun Wifi switch."""
 
     def __init__(self, hass, name, host, port, path, user, passwd):
         """Initialize the device."""
         self._hass = hass
-        self._name = name
-        self._state = False
+        self._attr_name = name
+        self._attr_is_on = False
         self._url = f"http://{host}:{port}{path}"
         if user is not None:
             self._auth = (user, passwd)
@@ -74,7 +89,7 @@ class KankunSwitch(SwitchDevice):
 
     def _switch(self, newstate):
         """Switch on or off."""
-        _LOGGER.info("Switching to state: %s", newstate)
+        _LOGGER.debug("Switching to state: %s", newstate)
 
         try:
             req = requests.get(
@@ -86,7 +101,7 @@ class KankunSwitch(SwitchDevice):
 
     def _query_state(self):
         """Query switch state."""
-        _LOGGER.info("Querying state from: %s", self._url)
+        _LOGGER.debug("Querying state from: %s", self._url)
 
         try:
             req = requests.get(f"{self._url}?get=state", auth=self._auth, timeout=5)
@@ -94,31 +109,16 @@ class KankunSwitch(SwitchDevice):
         except requests.RequestException:
             _LOGGER.error("State query failed")
 
-    @property
-    def should_poll(self):
-        """Return the polling state."""
-        return True
-
-    @property
-    def name(self):
-        """Return the name of the switch."""
-        return self._name
-
-    @property
-    def is_on(self):
-        """Return true if device is on."""
-        return self._state
-
-    def update(self):
+    def update(self) -> None:
         """Update device state."""
-        self._state = self._query_state()
+        self._attr_is_on = self._query_state()
 
-    def turn_on(self, **kwargs):
+    def turn_on(self, **kwargs: Any) -> None:
         """Turn the device on."""
         if self._switch("on"):
-            self._state = True
+            self._attr_is_on = True
 
-    def turn_off(self, **kwargs):
+    def turn_off(self, **kwargs: Any) -> None:
         """Turn the device off."""
         if self._switch("off"):
-            self._state = False
+            self._attr_is_on = False

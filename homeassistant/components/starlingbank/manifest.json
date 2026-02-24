@@ -1,10 +1,10 @@
 {
   "domain": "starlingbank",
-  "name": "Starlingbank",
+  "name": "Starling Bank",
+  "codeowners": [],
   "documentation": "https://www.home-assistant.io/integrations/starlingbank",
-  "requirements": [
-    "starlingbank==3.1"
-  ],
-  "dependencies": [],
-  "codeowners": []
+  "iot_class": "cloud_polling",
+  "loggers": ["starlingbank"],
+  "quality_scale": "legacy",
+  "requirements": ["starlingbank==3.2"]
 }

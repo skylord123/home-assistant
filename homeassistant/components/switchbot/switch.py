@@ -1,92 +1,128 @@
-"""Support for Switchbot."""
+"""Support for Switchbot bot."""
+
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict
+from typing import Any
 
-import voluptuous as vol
+import switchbot
 
-import homeassistant.helpers.config_validation as cv
-from homeassistant.components.switch import SwitchDevice, PLATFORM_SCHEMA
-from homeassistant.const import CONF_NAME, CONF_MAC
+from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
+from homeassistant.const import STATE_ON
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
+from .const import DOMAIN
+from .coordinator import SwitchbotConfigEntry, SwitchbotDataUpdateCoordinator
+from .entity import SwitchbotSwitchedEntity, exception_handler
+
+PARALLEL_UPDATES = 0
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_NAME = "Switchbot"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_MAC): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-    }
-)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: SwitchbotConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Switchbot based on a config entry."""
+    coordinator = entry.runtime_data
+
+    if isinstance(coordinator.device, switchbot.SwitchbotRelaySwitch2PM):
+        entries = [
+            SwitchbotMultiChannelSwitch(coordinator, channel)
+            for channel in range(1, coordinator.device.channel + 1)
+        ]
+        async_add_entities(entries)
+    else:
+        async_add_entities([SwitchBotSwitch(coordinator)])
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    """Perform the setup for Switchbot devices."""
-    name = config.get(CONF_NAME)
-    mac_addr = config[CONF_MAC]
-    add_entities([SwitchBot(mac_addr, name)])
+class SwitchBotSwitch(SwitchbotSwitchedEntity, SwitchEntity, RestoreEntity):
+    """Representation of a Switchbot switch."""
 
+    _attr_device_class = SwitchDeviceClass.SWITCH
+    _attr_translation_key = "bot"
+    _attr_name = None
+    _device: switchbot.Switchbot
 
-class SwitchBot(SwitchDevice, RestoreEntity):
-    """Representation of a Switchbot."""
-
-    def __init__(self, mac, name) -> None:
+    def __init__(self, coordinator: SwitchbotDataUpdateCoordinator) -> None:
         """Initialize the Switchbot."""
-        # pylint: disable=import-error, no-member
-        import switchbot
+        super().__init__(coordinator)
+        self._attr_is_on = False
 
-        self._state = None
-        self._last_run_success = None
-        self._name = name
-        self._mac = mac
-        self._device = switchbot.Switchbot(mac=mac)
-
-    async def async_added_to_hass(self):
+    async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
         await super().async_added_to_hass()
-        state = await self.async_get_last_state()
-        if not state:
+        if not (last_state := await self.async_get_last_state()):
             return
-        self._state = state.state == "on"
-
-    def turn_on(self, **kwargs) -> None:
-        """Turn device on."""
-        if self._device.turn_on():
-            self._state = True
-            self._last_run_success = True
-        else:
-            self._last_run_success = False
-
-    def turn_off(self, **kwargs) -> None:
-        """Turn device off."""
-        if self._device.turn_off():
-            self._state = False
-            self._last_run_success = True
-        else:
-            self._last_run_success = False
+        self._attr_is_on = last_state.state == STATE_ON
+        self._last_run_success = last_state.attributes.get("last_run_success")
 
     @property
     def assumed_state(self) -> bool:
         """Return true if unable to access real state of entity."""
-        return True
+        return not self._device.switch_mode()
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if device is on."""
-        return self._state
+        if not self._device.switch_mode():
+            return self._attr_is_on
+        return self._device.is_on()
 
     @property
-    def unique_id(self) -> str:
-        """Return a unique, HASS-friendly identifier for this entity."""
-        return self._mac.replace(":", "")
-
-    @property
-    def name(self) -> str:
-        """Return the name of the switch."""
-        return self._name
-
-    @property
-    def device_state_attributes(self) -> Dict[str, Any]:
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
-        return {"last_run_success": self._last_run_success}
+        return {
+            **super().extra_state_attributes,
+            "switch_mode": self._device.switch_mode(),
+        }
+
+
+class SwitchbotMultiChannelSwitch(SwitchbotSwitchedEntity, SwitchEntity):
+    """Representation of a Switchbot multi-channel switch."""
+
+    _attr_device_class = SwitchDeviceClass.SWITCH
+    _device: switchbot.Switchbot
+    _attr_name = None
+
+    def __init__(
+        self, coordinator: SwitchbotDataUpdateCoordinator, channel: int
+    ) -> None:
+        """Initialize the Switchbot."""
+        super().__init__(coordinator)
+        self._channel = channel
+        self._attr_unique_id = f"{coordinator.base_unique_id}-{channel}"
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{coordinator.base_unique_id}-channel-{channel}")},
+            manufacturer="SwitchBot",
+            model_id="RelaySwitch2PM",
+            name=f"{coordinator.device_name} Channel {channel}",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if device is on."""
+        return self._device.is_on(self._channel)
+
+    @exception_handler
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn device on."""
+        _LOGGER.debug(
+            "Turn Switchbot device on %s, channel %d", self._address, self._channel
+        )
+        await self._device.turn_on(self._channel)
+        self.async_write_ha_state()
+
+    @exception_handler
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn device off."""
+        _LOGGER.debug(
+            "Turn Switchbot device off %s, channel %d", self._address, self._channel
+        )
+        await self._device.turn_off(self._channel)
+        self.async_write_ha_state()

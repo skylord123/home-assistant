@@ -1,36 +1,50 @@
 """Support for the Mailgun mail notifications."""
-import logging
 
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from pymailgunner import (
+    Client,
+    MailgunCredentialsError,
+    MailgunDomainError,
+    MailgunError,
+)
 import voluptuous as vol
 
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
 from homeassistant.const import CONF_API_KEY, CONF_DOMAIN, CONF_RECIPIENT, CONF_SENDER
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import CONF_SANDBOX, DOMAIN as MAILGUN_DOMAIN
+from . import CONF_SANDBOX, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 # Images to attach to notification
 ATTR_IMAGES = "images"
 
-DEFAULT_SENDER = "hass@{domain}"
 DEFAULT_SANDBOX = False
 
-# pylint: disable=no-value-for-parameter
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {vol.Required(CONF_RECIPIENT): vol.Email(), vol.Optional(CONF_SENDER): vol.Email()}
 )
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> MailgunNotificationService | None:
     """Get the Mailgun notification service."""
-    data = hass.data[MAILGUN_DOMAIN]
+    data = hass.data[DOMAIN]
     mailgun_service = MailgunNotificationService(
         data.get(CONF_DOMAIN),
         data.get(CONF_SANDBOX),
@@ -58,31 +72,28 @@ class MailgunNotificationService(BaseNotificationService):
 
     def initialize_client(self):
         """Initialize the connection to Mailgun."""
-        from pymailgunner import Client
 
         self._client = Client(self._api_key, self._domain, self._sandbox)
         _LOGGER.debug("Mailgun domain: %s", self._client.domain)
         self._domain = self._client.domain
         if not self._sender:
-            self._sender = DEFAULT_SENDER.format(domain=self._domain)
+            self._sender = f"hass@{self._domain}"
 
     def connection_is_valid(self):
         """Check whether the provided credentials are valid."""
-        from pymailgunner import MailgunCredentialsError, MailgunDomainError
 
         try:
             self.initialize_client()
         except MailgunCredentialsError:
             _LOGGER.exception("Invalid credentials")
             return False
-        except MailgunDomainError as mailgun_error:
-            _LOGGER.exception(mailgun_error)
+        except MailgunDomainError:
+            _LOGGER.exception("Unexpected exception")
             return False
         return True
 
-    def send_message(self, message="", **kwargs):
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a mail to the recipient."""
-        from pymailgunner import MailgunError
 
         subject = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
         data = kwargs.get(ATTR_DATA)
@@ -100,5 +111,5 @@ class MailgunNotificationService(BaseNotificationService):
                 files=files,
             )
             _LOGGER.debug("Message sent: %s", resp)
-        except MailgunError as mailgun_error:
-            _LOGGER.exception("Failed to send message: %s", mailgun_error)
+        except MailgunError:
+            _LOGGER.exception("Failed to send message")

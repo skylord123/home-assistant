@@ -1,10 +1,12 @@
 {
   "domain": "soundtouch",
-  "name": "Soundtouch",
+  "name": "Bose SoundTouch",
+  "codeowners": ["@kroimon"],
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/soundtouch",
-  "requirements": [
-    "libsoundtouch==0.7.2"
-  ],
-  "dependencies": [],
-  "codeowners": []
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["libsoundtouch"],
+  "requirements": ["libsoundtouch==0.8"],
+  "zeroconf": ["_soundtouch._tcp.local."]
 }

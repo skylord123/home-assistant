@@ -1,14 +1,12 @@
 {
   "domain": "daikin",
-  "name": "Daikin",
+  "name": "Daikin AC",
+  "codeowners": ["@fredrike"],
   "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/daikin",
-  "requirements": [
-    "pydaikin==1.6.1"
-  ],
-  "dependencies": [],
-  "codeowners": [
-    "@fredrike",
-    "@rofrantz"
-  ]
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["pydaikin"],
+  "requirements": ["pydaikin==2.17.2"],
+  "zeroconf": ["_dkapi._tcp.local."]
 }

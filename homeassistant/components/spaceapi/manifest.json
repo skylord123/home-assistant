@@ -1,12 +1,11 @@
 {
   "domain": "spaceapi",
-  "name": "Spaceapi",
+  "name": "SpaceAPI",
+  "codeowners": ["@fabaff"],
+  "config_flow": false,
+  "dependencies": ["http"],
   "documentation": "https://www.home-assistant.io/integrations/spaceapi",
-  "requirements": [],
-  "dependencies": [
-    "http"
-  ],
-  "codeowners": [
-    "@fabaff"
-  ]
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "quality_scale": "legacy"
 }

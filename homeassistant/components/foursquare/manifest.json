@@ -1,12 +1,9 @@
 {
   "domain": "foursquare",
   "name": "Foursquare",
+  "codeowners": [],
+  "dependencies": ["http"],
   "documentation": "https://www.home-assistant.io/integrations/foursquare",
-  "requirements": [],
-  "dependencies": [
-    "http"
-  ],
-  "codeowners": [
-    "@robbiet480"
-  ]
+  "iot_class": "cloud_push",
+  "quality_scale": "legacy"
 }

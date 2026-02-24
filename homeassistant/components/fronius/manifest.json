@@ -1,8 +1,17 @@
 {
   "domain": "fronius",
   "name": "Fronius",
+  "codeowners": ["@farmio"],
+  "config_flow": true,
+  "dhcp": [
+    {
+      "macaddress": "0003AC*"
+    }
+  ],
   "documentation": "https://www.home-assistant.io/integrations/fronius",
-  "requirements": ["pyfronius==0.4.6"],
-  "dependencies": [],
-  "codeowners": ["@nielstron"]
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "loggers": ["pyfronius"],
+  "quality_scale": "platinum",
+  "requirements": ["PyFronius==0.8.0"]
 }

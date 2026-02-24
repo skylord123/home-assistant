@@ -1,81 +1,65 @@
 """HTML5 Push Messaging notification service."""
-from datetime import datetime, timedelta
 
-from functools import partial
-from urllib.parse import urlparse
+from __future__ import annotations
+
+from contextlib import suppress
+from datetime import datetime, timedelta
+from http import HTTPStatus
 import json
 import logging
 import time
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
+from urllib.parse import urlparse
 import uuid
 
+from aiohttp import ClientError, ClientResponse, ClientSession, web
 from aiohttp.hdrs import AUTHORIZATION
 import jwt
-from pywebpush import WebPusher
 from py_vapid import Vapid
+from pywebpush import WebPusher, WebPushException, webpush_async
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
 from homeassistant.components import websocket_api
-from homeassistant.components.frontend import add_manifest_json_key
-from homeassistant.components.http import HomeAssistantView
-from homeassistant.const import (
-    HTTP_BAD_REQUEST,
-    HTTP_INTERNAL_SERVER_ERROR,
-    HTTP_UNAUTHORIZED,
-    URL_ROOT,
-)
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv
-from homeassistant.util import ensure_unique_string
-from homeassistant.util.json import load_json, save_json
-
+from homeassistant.components.http import KEY_HASS, HomeAssistantView
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TARGET,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
     BaseNotificationService,
+    NotifyEntity,
+    NotifyEntityFeature,
 )
+from homeassistant.components.websocket_api import ActiveConnection
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_NAME, URL_ROOT
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.json import save_json
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.util import ensure_unique_string
+from homeassistant.util.json import load_json_object
 
-from .const import DOMAIN, SERVICE_DISMISS
+from .const import (
+    ATTR_VAPID_EMAIL,
+    ATTR_VAPID_PRV_KEY,
+    ATTR_VAPID_PUB_KEY,
+    DOMAIN,
+    SERVICE_DISMISS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 REGISTRATIONS_FILE = "html5_push_registrations.conf"
 
-ATTR_GCM_SENDER_ID = "gcm_sender_id"
-ATTR_GCM_API_KEY = "gcm_api_key"
-ATTR_VAPID_PUB_KEY = "vapid_pub_key"
-ATTR_VAPID_PRV_KEY = "vapid_prv_key"
-ATTR_VAPID_EMAIL = "vapid_email"
-
-
-def gcm_api_deprecated(value):
-    """Warn user that GCM API config is deprecated."""
-    if value:
-        _LOGGER.warning(
-            "Configuring html5_push_notifications via the GCM api"
-            " has been deprecated and will stop working after April 11,"
-            " 2019. Use the VAPID configuration instead. For instructions,"
-            " see https://www.home-assistant.io/integrations/html5/"
-        )
-    return value
-
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Optional(ATTR_GCM_SENDER_ID): vol.All(cv.string, gcm_api_deprecated),
-        vol.Optional(ATTR_GCM_API_KEY): cv.string,
-        vol.Optional(ATTR_VAPID_PUB_KEY): cv.string,
-        vol.Optional(ATTR_VAPID_PRV_KEY): cv.string,
-        vol.Optional(ATTR_VAPID_EMAIL): cv.string,
-    }
-)
 
 ATTR_SUBSCRIPTION = "subscription"
 ATTR_BROWSER = "browser"
-ATTR_NAME = "name"
 
 ATTR_ENDPOINT = "endpoint"
 ATTR_KEYS = "keys"
@@ -94,6 +78,9 @@ DEFAULT_PRIORITY = "normal"
 ATTR_TTL = "ttl"
 DEFAULT_TTL = 86400
 
+DEFAULT_BADGE = "/static/images/notification-badge.png"
+DEFAULT_ICON = "/static/icons/favicon-192x192.png"
+
 ATTR_JWT = "jwt"
 
 WS_TYPE_APPKEY = "notify/html5/appkey"
@@ -104,6 +91,7 @@ SCHEMA_WS_APPKEY = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend(
 # The number of days after the moment a notification is sent that a JWT
 # is valid.
 JWT_VALID_DAYS = 7
+VAPID_CLAIM_VALID_HOURS = 12
 
 KEYS_SCHEMA = vol.All(
     dict,
@@ -116,7 +104,6 @@ SUBSCRIPTION_SCHEMA = vol.All(
     dict,
     vol.Schema(
         {
-            # pylint: disable=no-value-for-parameter
             vol.Required(ATTR_ENDPOINT): vol.Url(),
             vol.Required(ATTR_KEYS): KEYS_SCHEMA,
             vol.Optional(ATTR_EXPIRATIONTIME): vol.Any(None, cv.positive_int),
@@ -165,49 +152,75 @@ HTML5_SHOWNOTIFICATION_PARAMETERS = (
     "tag",
     "timestamp",
     "vibrate",
+    "silent",
 )
 
 
-def get_service(hass, config, discovery_info=None):
+class Keys(TypedDict):
+    """Types for keys."""
+
+    p256dh: str
+    auth: str
+
+
+class Subscription(TypedDict):
+    """Types for subscription."""
+
+    endpoint: str
+    expirationTime: int | None
+    keys: Keys
+
+
+class Registration(TypedDict):
+    """Types for registration."""
+
+    subscription: Subscription
+    browser: str
+    name: NotRequired[str]
+
+
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> HTML5NotificationService | None:
     """Get the HTML5 push notification service."""
-    json_path = hass.config.path(REGISTRATIONS_FILE)
-
-    registrations = _load_config(json_path)
-
-    if registrations is None:
+    if config:
+        return None
+    if discovery_info is None:
         return None
 
-    vapid_pub_key = config.get(ATTR_VAPID_PUB_KEY)
-    vapid_prv_key = config.get(ATTR_VAPID_PRV_KEY)
-    vapid_email = config.get(ATTR_VAPID_EMAIL)
+    json_path = hass.config.path(REGISTRATIONS_FILE)
 
-    def websocket_appkey(hass, connection, msg):
+    registrations = await hass.async_add_executor_job(_load_config, json_path)
+
+    vapid_pub_key: str = discovery_info[ATTR_VAPID_PUB_KEY]
+    vapid_prv_key: str = discovery_info[ATTR_VAPID_PRV_KEY]
+    vapid_email: str = discovery_info[ATTR_VAPID_EMAIL]
+
+    @callback
+    def websocket_appkey(
+        _hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+    ) -> None:
         connection.send_message(websocket_api.result_message(msg["id"], vapid_pub_key))
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_APPKEY, websocket_appkey, SCHEMA_WS_APPKEY
+    websocket_api.async_register_command(
+        hass, WS_TYPE_APPKEY, websocket_appkey, SCHEMA_WS_APPKEY
     )
 
     hass.http.register_view(HTML5PushRegistrationView(registrations, json_path))
     hass.http.register_view(HTML5PushCallbackView(registrations))
 
-    gcm_api_key = config.get(ATTR_GCM_API_KEY)
-    gcm_sender_id = config.get(ATTR_GCM_SENDER_ID)
-
-    if gcm_sender_id is not None:
-        add_manifest_json_key(ATTR_GCM_SENDER_ID, config.get(ATTR_GCM_SENDER_ID))
-
+    session = async_get_clientsession(hass)
     return HTML5NotificationService(
-        hass, gcm_api_key, vapid_prv_key, vapid_email, registrations, json_path
+        hass, session, vapid_prv_key, vapid_email, registrations, json_path
     )
 
 
-def _load_config(filename):
+def _load_config(filename: str) -> dict[str, Registration]:
     """Load configuration."""
-    try:
-        return load_json(filename)
-    except HomeAssistantError:
-        pass
+    with suppress(HomeAssistantError):
+        return cast(dict[str, Registration], load_json_object(filename))
     return {}
 
 
@@ -217,21 +230,22 @@ class HTML5PushRegistrationView(HomeAssistantView):
     url = "/api/notify.html5"
     name = "api:notify.html5"
 
-    def __init__(self, registrations, json_path):
+    def __init__(self, registrations: dict[str, Registration], json_path: str) -> None:
         """Init HTML5PushRegistrationView."""
         self.registrations = registrations
         self.json_path = json_path
 
-    async def post(self, request):
+    async def post(self, request: web.Request) -> web.Response:
         """Accept the POST request for push registrations from a browser."""
+
         try:
-            data = await request.json()
+            data: Registration = await request.json()
         except ValueError:
-            return self.json_message("Invalid JSON", HTTP_BAD_REQUEST)
+            return self.json_message("Invalid JSON", HTTPStatus.BAD_REQUEST)
         try:
-            data = REGISTER_SCHEMA(data)
+            data = cast(Registration, REGISTER_SCHEMA(data))
         except vol.Invalid as ex:
-            return self.json_message(humanize_error(data, ex), HTTP_BAD_REQUEST)
+            return self.json_message(humanize_error(data, ex), HTTPStatus.BAD_REQUEST)
 
         devname = data.get(ATTR_NAME)
         data.pop(ATTR_NAME, None)
@@ -242,9 +256,11 @@ class HTML5PushRegistrationView(HomeAssistantView):
         self.registrations[name] = data
 
         try:
-            hass = request.app["hass"]
+            hass = request.app[KEY_HASS]
 
-            await hass.async_add_job(save_json, self.json_path, self.registrations)
+            await hass.async_add_executor_job(
+                save_json, self.json_path, self.registrations
+            )
             return self.json_message("Push notification subscriber registered.")
         except HomeAssistantError:
             if previous_registration is not None:
@@ -253,31 +269,35 @@ class HTML5PushRegistrationView(HomeAssistantView):
                 self.registrations.pop(name)
 
             return self.json_message(
-                "Error saving registration.", HTTP_INTERNAL_SERVER_ERROR
+                "Error saving registration.", HTTPStatus.INTERNAL_SERVER_ERROR
             )
 
-    def find_registration_name(self, data, suggested=None):
+    def find_registration_name(
+        self,
+        data: Registration,
+        suggested: str | None = None,
+    ):
         """Find a registration name matching data or generate a unique one."""
-        endpoint = data.get(ATTR_SUBSCRIPTION).get(ATTR_ENDPOINT)
+        endpoint = data["subscription"]["endpoint"]
         for key, registration in self.registrations.items():
-            subscription = registration.get(ATTR_SUBSCRIPTION)
+            subscription = registration["subscription"]
             if subscription.get(ATTR_ENDPOINT) == endpoint:
                 return key
         return ensure_unique_string(suggested or "unnamed device", self.registrations)
 
-    async def delete(self, request):
+    async def delete(self, request: web.Request):
         """Delete a registration."""
         try:
-            data = await request.json()
+            data: dict[str, Any] = await request.json()
         except ValueError:
-            return self.json_message("Invalid JSON", HTTP_BAD_REQUEST)
+            return self.json_message("Invalid JSON", HTTPStatus.BAD_REQUEST)
 
-        subscription = data.get(ATTR_SUBSCRIPTION)
+        subscription: dict[str, Any] = data[ATTR_SUBSCRIPTION]
 
         found = None
 
         for key, registration in self.registrations.items():
-            if registration.get(ATTR_SUBSCRIPTION) == subscription:
+            if registration["subscription"] == subscription:
                 found = key
                 break
 
@@ -288,13 +308,15 @@ class HTML5PushRegistrationView(HomeAssistantView):
         reg = self.registrations.pop(found)
 
         try:
-            hass = request.app["hass"]
+            hass = request.app[KEY_HASS]
 
-            await hass.async_add_job(save_json, self.json_path, self.registrations)
+            await hass.async_add_executor_job(
+                save_json, self.json_path, self.registrations
+            )
         except HomeAssistantError:
             self.registrations[found] = reg
             return self.json_message(
-                "Error saving registration.", HTTP_INTERNAL_SERVER_ERROR
+                "Error saving registration.", HTTPStatus.INTERNAL_SERVER_ERROR
             )
 
         return self.json_message("Push notification subscriber unregistered.")
@@ -307,11 +329,11 @@ class HTML5PushCallbackView(HomeAssistantView):
     url = "/api/notify.html5/callback"
     name = "api:notify.html5/callback"
 
-    def __init__(self, registrations):
+    def __init__(self, registrations: dict[str, Registration]) -> None:
         """Init HTML5PushCallbackView."""
         self.registrations = registrations
 
-    def decode_jwt(self, token):
+    def decode_jwt(self, token: str) -> web.Response | dict[str, Any]:
         """Find the registration that signed this JWT and return it."""
 
         # 1.  Check claims w/o verifying to see if a target is in there.
@@ -319,62 +341,64 @@ class HTML5PushCallbackView(HomeAssistantView):
         # 2a. If decode is successful, return the payload.
         # 2b. If decode is unsuccessful, return a 401.
 
-        target_check = jwt.decode(token, verify=False)
+        target_check: dict[str, Any] = jwt.decode(
+            token, algorithms=["ES256", "HS256"], options={"verify_signature": False}
+        )
         if target_check.get(ATTR_TARGET) in self.registrations:
             possible_target = self.registrations[target_check[ATTR_TARGET]]
-            key = possible_target[ATTR_SUBSCRIPTION][ATTR_KEYS][ATTR_AUTH]
-            try:
+            key = possible_target["subscription"]["keys"]["auth"]
+            with suppress(jwt.exceptions.DecodeError):
                 return jwt.decode(token, key, algorithms=["ES256", "HS256"])
-            except jwt.exceptions.DecodeError:
-                pass
 
         return self.json_message(
-            "No target found in JWT", status_code=HTTP_UNAUTHORIZED
+            "No target found in JWT", status_code=HTTPStatus.UNAUTHORIZED
         )
 
     # The following is based on code from Auth0
     # https://auth0.com/docs/quickstart/backend/python
-    def check_authorization_header(self, request):
+    def check_authorization_header(
+        self, request: web.Request
+    ) -> web.Response | dict[str, Any]:
         """Check the authorization header."""
-
-        auth = request.headers.get(AUTHORIZATION, None)
-        if not auth:
+        if not (auth := request.headers.get(AUTHORIZATION)):
             return self.json_message(
-                "Authorization header is expected", status_code=HTTP_UNAUTHORIZED
+                "Authorization header is expected", status_code=HTTPStatus.UNAUTHORIZED
             )
 
         parts = auth.split()
 
         if parts[0].lower() != "bearer":
             return self.json_message(
-                "Authorization header must " "start with Bearer",
-                status_code=HTTP_UNAUTHORIZED,
+                "Authorization header must start with Bearer",
+                status_code=HTTPStatus.UNAUTHORIZED,
             )
         if len(parts) != 2:
             return self.json_message(
-                "Authorization header must " "be Bearer token",
-                status_code=HTTP_UNAUTHORIZED,
+                "Authorization header must be Bearer token",
+                status_code=HTTPStatus.UNAUTHORIZED,
             )
 
         token = parts[1]
         try:
             payload = self.decode_jwt(token)
         except jwt.exceptions.InvalidTokenError:
-            return self.json_message("token is invalid", status_code=HTTP_UNAUTHORIZED)
+            return self.json_message(
+                "token is invalid", status_code=HTTPStatus.UNAUTHORIZED
+            )
         return payload
 
-    async def post(self, request):
+    async def post(self, request: web.Request) -> web.Response:
         """Accept the POST request for push registrations event callback."""
         auth_check = self.check_authorization_header(request)
         if not isinstance(auth_check, dict):
             return auth_check
 
         try:
-            data = await request.json()
+            data: dict[str, str] = await request.json()
         except ValueError:
-            return self.json_message("Invalid JSON", HTTP_BAD_REQUEST)
+            return self.json_message("Invalid JSON", HTTPStatus.BAD_REQUEST)
 
-        event_payload = {
+        event_payload: dict[str, Any] = {
             ATTR_TAG: data.get(ATTR_TAG),
             ATTR_TYPE: data[ATTR_TYPE],
             ATTR_TARGET: auth_check[ATTR_TARGET],
@@ -394,25 +418,33 @@ class HTML5PushCallbackView(HomeAssistantView):
                 humanize_error(event_payload, ex),
             )
 
-        event_name = "{}.{}".format(NOTIFY_CALLBACK_EVENT, event_payload[ATTR_TYPE])
-        request.app["hass"].bus.fire(event_name, event_payload)
+        event_name = f"{NOTIFY_CALLBACK_EVENT}.{event_payload[ATTR_TYPE]}"
+        request.app[KEY_HASS].bus.fire(event_name, event_payload)
         return self.json({"status": "ok", "event": event_payload[ATTR_TYPE]})
 
 
 class HTML5NotificationService(BaseNotificationService):
     """Implement the notification service for HTML5."""
 
-    def __init__(self, hass, gcm_key, vapid_prv, vapid_email, registrations, json_path):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        session: ClientSession,
+        vapid_prv: str,
+        vapid_email: str,
+        registrations: dict[str, Registration],
+        json_path: str,
+    ) -> None:
         """Initialize the service."""
-        self._gcm_key = gcm_key
+        self.session = session
         self._vapid_prv = vapid_prv
         self._vapid_email = vapid_email
         self.registrations = registrations
         self.registrations_json_path = json_path
 
-        async def async_dismiss_message(service):
+        async def async_dismiss_message(service: ServiceCall) -> None:
             """Handle dismissing notification message service calls."""
-            kwargs = {}
+            kwargs: dict[str, Any] = {}
 
             if self.targets is not None:
                 kwargs[ATTR_TARGET] = self.targets
@@ -431,47 +463,38 @@ class HTML5NotificationService(BaseNotificationService):
         )
 
     @property
-    def targets(self):
+    def targets(self) -> dict[str, str]:
         """Return a dictionary of registered targets."""
-        targets = {}
-        for registration in self.registrations:
-            targets[registration] = registration
-        return targets
+        return {registration: registration for registration in self.registrations}
 
-    def dismiss(self, **kwargs):
-        """Dismisses a notification."""
-        data = kwargs.get(ATTR_DATA)
-        tag = data.get(ATTR_TAG) if data else ""
-        payload = {ATTR_TAG: tag, ATTR_DISMISS: True, ATTR_DATA: {}}
-
-        self._push_message(payload, **kwargs)
-
-    async def async_dismiss(self, **kwargs):
+    async def async_dismiss(self, **kwargs: Any) -> None:
         """Dismisses a notification.
 
         This method must be run in the event loop.
         """
-        await self.hass.async_add_executor_job(partial(self.dismiss, **kwargs))
+        data: dict[str, Any] | None = kwargs.get(ATTR_DATA)
+        tag: str = data.get(ATTR_TAG, "") if data else ""
+        payload = {ATTR_TAG: tag, ATTR_DISMISS: True, ATTR_DATA: {}}
 
-    def send_message(self, message="", **kwargs):
+        await self._push_message(payload, **kwargs)
+
+    async def async_send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to a user."""
         tag = str(uuid.uuid4())
-        payload = {
-            "badge": "/static/images/notification-badge.png",
+        payload: dict[str, Any] = {
+            "badge": DEFAULT_BADGE,
             "body": message,
             ATTR_DATA: {},
-            "icon": "/static/icons/favicon-192x192.png",
+            "icon": DEFAULT_ICON,
             ATTR_TAG: tag,
             ATTR_TITLE: kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT),
         }
-
-        data = kwargs.get(ATTR_DATA)
-
+        data: dict[str, Any] | None = kwargs.get(ATTR_DATA)
         if data:
             # Pick out fields that should go into the notification directly vs
             # into the notification data dictionary.
 
-            data_tmp = {}
+            data_tmp: dict[str, Any] = {}
 
             for key, val in data.items():
                 if key in HTML5_SHOWNOTIFICATION_PARAMETERS:
@@ -487,67 +510,79 @@ class HTML5NotificationService(BaseNotificationService):
         ):
             payload[ATTR_DATA][ATTR_URL] = URL_ROOT
 
-        self._push_message(payload, **kwargs)
+        await self._push_message(payload, **kwargs)
 
-    def _push_message(self, payload, **kwargs):
+    async def _push_message(self, payload: dict[str, Any], **kwargs: Any) -> None:
         """Send the message."""
 
         timestamp = int(time.time())
         ttl = int(kwargs.get(ATTR_TTL, DEFAULT_TTL))
-        priority = kwargs.get(ATTR_PRIORITY, DEFAULT_PRIORITY)
+        priority: str = kwargs.get(ATTR_PRIORITY, DEFAULT_PRIORITY)
         if priority not in ["normal", "high"]:
             priority = DEFAULT_PRIORITY
         payload["timestamp"] = timestamp * 1000  # Javascript ms since epoch
-        targets = kwargs.get(ATTR_TARGET)
 
-        if not targets:
+        if not (targets := kwargs.get(ATTR_TARGET)):
             targets = self.registrations.keys()
 
         for target in list(targets):
             info = self.registrations.get(target)
             try:
-                info = REGISTER_SCHEMA(info)
+                info = cast(Registration, REGISTER_SCHEMA(info))
             except vol.Invalid:
                 _LOGGER.error(
-                    "%s is not a valid HTML5 push notification" " target", target
+                    "%s is not a valid HTML5 push notification target", target
                 )
                 continue
+            subscription = info["subscription"]
             payload[ATTR_DATA][ATTR_JWT] = add_jwt(
                 timestamp,
                 target,
                 payload[ATTR_TAG],
-                info[ATTR_SUBSCRIPTION][ATTR_KEYS][ATTR_AUTH],
+                subscription["keys"]["auth"],
             )
-            webpusher = WebPusher(info[ATTR_SUBSCRIPTION])
-            if self._vapid_prv and self._vapid_email:
-                vapid_headers = create_vapid_headers(
-                    self._vapid_email, info[ATTR_SUBSCRIPTION], self._vapid_prv
-                )
-                vapid_headers.update({"urgency": priority, "priority": priority})
-                response = webpusher.send(
-                    data=json.dumps(payload), headers=vapid_headers, ttl=ttl
-                )
-            else:
-                # Only pass the gcm key if we're actually using GCM
-                # If we don't, notifications break on FireFox
-                gcm_key = (
-                    self._gcm_key
-                    if "googleapis.com" in info[ATTR_SUBSCRIPTION][ATTR_ENDPOINT]
-                    else None
-                )
-                response = webpusher.send(json.dumps(payload), gcm_key=gcm_key, ttl=ttl)
 
-            if response.status_code == 410:
+            webpusher = WebPusher(
+                cast(dict[str, Any], info["subscription"]), aiohttp_session=self.session
+            )
+
+            endpoint = urlparse(subscription["endpoint"])
+            vapid_claims = {
+                "sub": f"mailto:{self._vapid_email}",
+                "aud": f"{endpoint.scheme}://{endpoint.netloc}",
+                "exp": timestamp + (VAPID_CLAIM_VALID_HOURS * 60 * 60),
+            }
+            vapid_headers = Vapid.from_string(self._vapid_prv).sign(vapid_claims)
+            vapid_headers.update({"urgency": priority, "priority": priority})
+
+            response = await webpusher.send_async(
+                data=json.dumps(payload), headers=vapid_headers, ttl=ttl
+            )
+
+            if TYPE_CHECKING:
+                assert not isinstance(response, str)
+
+            if response.status == HTTPStatus.GONE:
                 _LOGGER.info("Notification channel has expired")
                 reg = self.registrations.pop(target)
-                if not save_json(self.registrations_json_path, self.registrations):
+                try:
+                    await self.hass.async_add_executor_job(
+                        save_json, self.registrations_json_path, self.registrations
+                    )
+                except HomeAssistantError:
                     self.registrations[target] = reg
                     _LOGGER.error("Error saving registration")
                 else:
                     _LOGGER.info("Configuration saved")
+            elif response.status >= HTTPStatus.BAD_REQUEST:
+                _LOGGER.error(
+                    "There was an issue sending the notification %s: %s",
+                    response.status,
+                    await response.text(),
+                )
 
 
-def add_jwt(timestamp, target, tag, jwt_secret):
+def add_jwt(timestamp: int, target: str, tag: str, jwt_secret: str) -> str:
     """Create JWT json to put into payload."""
 
     jwt_exp = datetime.fromtimestamp(timestamp) + timedelta(days=JWT_VALID_DAYS)
@@ -558,18 +593,129 @@ def add_jwt(timestamp, target, tag, jwt_secret):
         ATTR_TARGET: target,
         ATTR_TAG: tag,
     }
-    return jwt.encode(jwt_claims, jwt_secret).decode("utf-8")
+    return jwt.encode(jwt_claims, jwt_secret)
 
 
-def create_vapid_headers(vapid_email, subscription_info, vapid_private_key):
-    """Create encrypted headers to send to WebPusher."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the notification entity platform."""
 
-    if vapid_email and vapid_private_key and ATTR_ENDPOINT in subscription_info:
-        url = urlparse(subscription_info.get(ATTR_ENDPOINT))
-        vapid_claims = {
-            "sub": f"mailto:{vapid_email}",
-            "aud": f"{url.scheme}://{url.netloc}",
+    json_path = hass.config.path(REGISTRATIONS_FILE)
+    registrations = await hass.async_add_executor_job(_load_config, json_path)
+
+    session = async_get_clientsession(hass)
+    async_add_entities(
+        HTML5NotifyEntity(config_entry, target, registrations, session, json_path)
+        for target in registrations
+    )
+
+
+class HTML5NotifyEntity(NotifyEntity):
+    """Representation of a notification entity."""
+
+    _attr_has_entity_name = True
+    _attr_name = None
+
+    _attr_supported_features = NotifyEntityFeature.TITLE
+
+    def __init__(
+        self,
+        config_entry: ConfigEntry,
+        target: str,
+        registrations: dict[str, Registration],
+        session: ClientSession,
+        json_path: str,
+    ) -> None:
+        """Initialize the entity."""
+        self.config_entry = config_entry
+        self.target = target
+        self.registrations = registrations
+        self.registration = registrations[target]
+        self.session = session
+        self.json_path = json_path
+
+        self._attr_unique_id = f"{config_entry.entry_id}_{target}_device"
+        self._attr_device_info = DeviceInfo(
+            entry_type=DeviceEntryType.SERVICE,
+            name=target,
+            model=self.registration["browser"].capitalize(),
+            identifiers={(DOMAIN, f"{config_entry.entry_id}_{target}")},
+        )
+
+    async def async_send_message(self, message: str, title: str | None = None) -> None:
+        """Send a message to a device."""
+        timestamp = int(time.time())
+        tag = str(uuid.uuid4())
+
+        payload: dict[str, Any] = {
+            "badge": DEFAULT_BADGE,
+            "body": message,
+            "icon": DEFAULT_ICON,
+            ATTR_TAG: tag,
+            ATTR_TITLE: title or ATTR_TITLE_DEFAULT,
+            "timestamp": timestamp * 1000,
+            ATTR_DATA: {
+                ATTR_JWT: add_jwt(
+                    timestamp,
+                    self.target,
+                    tag,
+                    self.registration["subscription"]["keys"]["auth"],
+                )
+            },
         }
-        vapid = Vapid.from_string(private_key=vapid_private_key)
-        return vapid.sign(vapid_claims)
-    return None
+
+        endpoint = urlparse(self.registration["subscription"]["endpoint"])
+        vapid_claims = {
+            "sub": f"mailto:{self.config_entry.data[ATTR_VAPID_EMAIL]}",
+            "aud": f"{endpoint.scheme}://{endpoint.netloc}",
+            "exp": timestamp + (VAPID_CLAIM_VALID_HOURS * 60 * 60),
+        }
+
+        try:
+            response = await webpush_async(
+                cast(dict[str, Any], self.registration["subscription"]),
+                json.dumps(payload),
+                self.config_entry.data[ATTR_VAPID_PRV_KEY],
+                vapid_claims,
+                aiohttp_session=self.session,
+            )
+            cast(ClientResponse, response).raise_for_status()
+        except WebPushException as e:
+            if cast(ClientResponse, e.response).status == HTTPStatus.GONE:
+                reg = self.registrations.pop(self.target)
+                try:
+                    await self.hass.async_add_executor_job(
+                        save_json, self.json_path, self.registrations
+                    )
+                except HomeAssistantError:
+                    self.registrations[self.target] = reg
+                    _LOGGER.error("Error saving registration")
+
+                self.async_write_ha_state()
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="channel_expired",
+                    translation_placeholders={"target": self.target},
+                ) from e
+
+            _LOGGER.debug("Full exception", exc_info=True)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="request_error",
+                translation_placeholders={"target": self.target},
+            ) from e
+        except ClientError as e:
+            _LOGGER.debug("Full exception", exc_info=True)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="connection_error",
+                translation_placeholders={"target": self.target},
+            ) from e
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return super().available and self.target in self.registrations

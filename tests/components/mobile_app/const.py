@@ -1,4 +1,5 @@
 """Constants for mobile_app tests."""
+
 CALL_SERVICE = {
     "type": "call_service",
     "data": {"domain": "test", "service": "mobile_app", "service_data": {"foo": "bar"}},
@@ -30,6 +31,7 @@ REGISTER_CLEARTEXT = {
     "device_name": "Test 1",
     "manufacturer": "mobile_app",
     "model": "Test",
+    "device_id": "mock-device-id",
     "os_name": "Linux",
     "os_version": "1.0",
     "supports_encryption": False,

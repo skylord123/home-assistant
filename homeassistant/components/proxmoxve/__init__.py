@@ -1,34 +1,44 @@
 """Support for Proxmox VE."""
-from enum import Enum
-import logging
-import time
 
-from proxmoxer import ProxmoxAPI
-from proxmoxer.backends.https import AuthenticationError
+from __future__ import annotations
+
+import logging
+
 import voluptuous as vol
 
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_USERNAME,
     CONF_VERIFY_SSL,
+    Platform,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.typing import ConfigType
 
-_LOGGER = logging.getLogger(__name__)
+from .const import (
+    CONF_CONTAINERS,
+    CONF_NODE,
+    CONF_NODES,
+    CONF_REALM,
+    CONF_VMS,
+    DEFAULT_PORT,
+    DEFAULT_REALM,
+    DEFAULT_VERIFY_SSL,
+    DOMAIN,
+)
+from .coordinator import ProxmoxConfigEntry, ProxmoxCoordinator
 
-DOMAIN = "proxmoxve"
-PROXMOX_CLIENTS = "proxmox_clients"
-CONF_REALM = "realm"
-CONF_NODE = "node"
-CONF_NODES = "nodes"
-CONF_VMS = "vms"
-CONF_CONTAINERS = "containers"
+PLATFORMS = [Platform.BINARY_SENSOR]
 
-DEFAULT_PORT = 8006
-DEFAULT_REALM = "pam"
-DEFAULT_VERIFY_SSL = True
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -69,86 +79,99 @@ CONFIG_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
+_LOGGER = logging.getLogger(__name__)
 
-def setup(hass, config):
-    """Set up the component."""
 
-    # Create API Clients for later use
-    hass.data[PROXMOX_CLIENTS] = {}
-    for entry in config[DOMAIN]:
-        host = entry[CONF_HOST]
-        port = entry[CONF_PORT]
-        user = entry[CONF_USERNAME]
-        realm = entry[CONF_REALM]
-        password = entry[CONF_PASSWORD]
-        verify_ssl = entry[CONF_VERIFY_SSL]
-
-        try:
-            # Construct an API client with the given data for the given host
-            proxmox_client = ProxmoxClient(
-                host, port, user, realm, password, verify_ssl
-            )
-            proxmox_client.build_client()
-        except AuthenticationError:
-            _LOGGER.warning(
-                "Invalid credentials for proxmox instance %s:%d", host, port
-            )
-            continue
-
-        hass.data[PROXMOX_CLIENTS][f"{host}:{port}"] = proxmox_client
-
-    if hass.data[PROXMOX_CLIENTS]:
-        hass.helpers.discovery.load_platform(
-            "binary_sensor", DOMAIN, {"entries": config[DOMAIN]}, config
-        )
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Import the Proxmox configuration from YAML."""
+    if DOMAIN not in config:
         return True
 
-    return False
+    hass.async_create_task(_async_setup(hass, config))
+
+    return True
 
 
-class ProxmoxItemType(Enum):
-    """Represents the different types of machines in Proxmox."""
+async def _async_setup(hass: HomeAssistant, config: ConfigType) -> None:
+    for entry_config in config[DOMAIN]:
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data=entry_config,
+        )
+        if (
+            result.get("type") is FlowResultType.ABORT
+            and result.get("reason") != "already_configured"
+        ):
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                f"deprecated_yaml_import_issue_{result.get('reason')}",
+                breaks_in_ha_version="2026.8.0",
+                is_fixable=False,
+                issue_domain=DOMAIN,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=f"deprecated_yaml_import_issue_{result.get('reason')}",
+                translation_placeholders={
+                    "domain": DOMAIN,
+                    "integration_title": "Proxmox VE",
+                },
+            )
+            return
 
-    qemu = 0
-    lxc = 1
-
-
-class ProxmoxClient:
-    """A wrapper for the proxmoxer ProxmoxAPI client."""
-
-    def __init__(self, host, port, user, realm, password, verify_ssl):
-        """Initialize the ProxmoxClient."""
-
-        self._host = host
-        self._port = port
-        self._user = user
-        self._realm = realm
-        self._password = password
-        self._verify_ssl = verify_ssl
-
-        self._proxmox = None
-        self._connection_start_time = None
-
-    def build_client(self):
-        """Construct the ProxmoxAPI client."""
-
-        self._proxmox = ProxmoxAPI(
-            self._host,
-            port=self._port,
-            user=f"{self._user}@{self._realm}",
-            password=self._password,
-            verify_ssl=self._verify_ssl,
+        ir.async_create_issue(
+            hass,
+            HOMEASSISTANT_DOMAIN,
+            "deprecated_yaml",
+            breaks_in_ha_version="2026.8.0",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="deprecated_yaml",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": "Proxmox VE",
+            },
         )
 
-        self._connection_start_time = time.time()
 
-    def get_api_client(self):
-        """Return the ProxmoxAPI client and rebuild it if necessary."""
+async def async_setup_entry(hass: HomeAssistant, entry: ProxmoxConfigEntry) -> bool:
+    """Set up a ProxmoxVE from a config entry."""
+    coordinator = ProxmoxCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
 
-        connection_age = time.time() - self._connection_start_time
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-        # Workaround for the Proxmoxer bug where the connection stops working after some time
-        if connection_age > 30 * 60:
-            self.build_client()
+    return True
 
-        return self._proxmox
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ProxmoxConfigEntry) -> bool:
+    """Migrate old config entries."""
+
+    # Migration for only the old binary sensors to new unique_id format
+    if entry.version < 2:
+        ent_reg = er.async_get(hass)
+        for entity_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+            new_unique_id = (
+                f"{entry.entry_id}_{entity_entry.unique_id.split('_')[-2]}_status"
+            )
+
+            _LOGGER.debug(
+                "Migrating entity %s from old unique_id %s to new unique_id %s",
+                entity_entry.entity_id,
+                entity_entry.unique_id,
+                new_unique_id,
+            )
+            ent_reg.async_update_entity(
+                entity_entry.entity_id, new_unique_id=new_unique_id
+            )
+
+        hass.config_entries.async_update_entry(entry, version=2)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ProxmoxConfigEntry) -> bool:
+    """Unload a config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

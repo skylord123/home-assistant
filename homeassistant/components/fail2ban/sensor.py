@@ -1,22 +1,24 @@
-"""
-Support for displaying IPs banned by fail2ban.
+"""Support for displaying IPs banned by fail2ban."""
 
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/sensor.fail2ban/
-
-"""
-import os
-import logging
+from __future__ import annotations
 
 from datetime import timedelta
-
+import logging
+import os
 import re
+from typing import Any
+
 import voluptuous as vol
 
-import homeassistant.helpers.config_validation as cv
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_NAME, CONF_FILE_PATH
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
+from homeassistant.const import CONF_FILE_PATH, CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ STATE_CURRENT_BANS = "current_bans"
 STATE_ALL_BANS = "total_bans"
 SCAN_INTERVAL = timedelta(seconds=120)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_JAILS): vol.All(cv.ensure_list, vol.Length(min=1)),
         vol.Optional(CONF_FILE_PATH): cv.isfile,
@@ -38,21 +40,23 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the fail2ban sensor."""
-    name = config.get(CONF_NAME)
-    jails = config.get(CONF_JAILS)
+    name = config[CONF_NAME]
+    jails = config[CONF_JAILS]
     log_file = config.get(CONF_FILE_PATH, DEFAULT_LOG)
 
-    device_list = []
     log_parser = BanLogParser(log_file)
-    for jail in jails:
-        device_list.append(BanSensor(name, jail, log_parser))
 
-    async_add_entities(device_list, True)
+    async_add_entities((BanSensor(name, jail, log_parser) for jail in jails), True)
 
 
-class BanSensor(Entity):
+class BanSensor(SensorEntity):
     """Implementation of a fail2ban sensor."""
 
     def __init__(self, name, jail, log_parser):
@@ -63,7 +67,7 @@ class BanSensor(Entity):
         self.last_ban = None
         self.log_parser = log_parser
         self.log_parser.ip_regex[self.jail] = re.compile(
-            r"\[{}\]\s*(Ban|Unban) (.*)".format(re.escape(self.jail))
+            rf"\[{re.escape(self.jail)}\]\s*(Ban|Unban) (.*)"
         )
         _LOGGER.debug("Setting up jail %s", self.jail)
 
@@ -73,16 +77,16 @@ class BanSensor(Entity):
         return self._name
 
     @property
-    def state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the fail2ban sensor."""
         return self.ban_dict
 
     @property
-    def state(self):
+    def native_value(self):
         """Return the most recently banned IP Address."""
         return self.last_ban
 
-    def update(self):
+    def update(self) -> None:
         """Update the list of banned ips."""
         self.log_parser.read_log(self.jail)
 
@@ -98,9 +102,11 @@ class BanSensor(Entity):
                     if len(self.ban_dict[STATE_ALL_BANS]) > 10:
                         self.ban_dict[STATE_ALL_BANS].pop(0)
 
-                elif entry[0] == "Unban":
-                    if current_ip in self.ban_dict[STATE_CURRENT_BANS]:
-                        self.ban_dict[STATE_CURRENT_BANS].remove(current_ip)
+                elif (
+                    entry[0] == "Unban"
+                    and current_ip in self.ban_dict[STATE_CURRENT_BANS]
+                ):
+                    self.ban_dict[STATE_CURRENT_BANS].remove(current_ip)
 
         if self.ban_dict[STATE_CURRENT_BANS]:
             self.last_ban = self.ban_dict[STATE_CURRENT_BANS][-1]
@@ -114,15 +120,15 @@ class BanLogParser:
     def __init__(self, log_file):
         """Initialize the parser."""
         self.log_file = log_file
-        self.data = list()
-        self.ip_regex = dict()
+        self.data = []
+        self.ip_regex = {}
 
     def read_log(self, jail):
         """Read the fail2ban log and find entries for jail."""
-        self.data = list()
+        self.data = []
         try:
-            with open(self.log_file, "r", encoding="utf-8") as file_data:
+            with open(self.log_file, encoding="utf-8") as file_data:
                 self.data = self.ip_regex[jail].findall(file_data.read())
 
-        except (IndexError, FileNotFoundError, IsADirectoryError, UnboundLocalError):
+        except IndexError, FileNotFoundError, IsADirectoryError, UnboundLocalError:
             _LOGGER.warning("File not present: %s", os.path.basename(self.log_file))

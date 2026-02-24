@@ -1,180 +1,115 @@
 """The SSDP integration."""
-import asyncio
-from datetime import timedelta
-import logging
-from urllib.parse import urlparse
 
-import aiohttp
-from defusedxml import ElementTree
-from netdisco import ssdp, util
+from __future__ import annotations
 
-from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.generated.ssdp import SSDP
+from collections.abc import Callable, Coroutine
+from functools import partial
+from typing import Any
 
-DOMAIN = "ssdp"
-SCAN_INTERVAL = timedelta(seconds=60)
+from homeassistant.core import HassJob, HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo as _SsdpServiceInfo
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_ssdp, bind_hass
+from homeassistant.util.logging import catch_log_exception
 
-ATTR_HOST = "host"
-ATTR_PORT = "port"
-ATTR_SSDP_DESCRIPTION = "ssdp_description"
-ATTR_ST = "ssdp_st"
-ATTR_NAME = "name"
-ATTR_MODEL_NAME = "model_name"
-ATTR_MODEL_NUMBER = "model_number"
-ATTR_SERIAL = "serial_number"
-ATTR_MANUFACTURER = "manufacturer"
-ATTR_MANUFACTURERURL = "manufacturerURL"
-ATTR_UDN = "udn"
-ATTR_UPNP_DEVICE_TYPE = "upnp_device_type"
-ATTR_PRESENTATIONURL = "presentation_url"
+from . import websocket_api
+from .const import DOMAIN, SSDP_SCANNER, UPNP_SERVER
+from .scanner import (
+    IntegrationMatchers,
+    Scanner,
+    SsdpChange,
+    SsdpHassJobCallback,  # noqa: F401
+)
+from .server import Server
 
-_LOGGER = logging.getLogger(__name__)
+# Attributes for accessing info from SSDP response
+ATTR_SSDP_LOCATION = "ssdp_location"
+ATTR_SSDP_ST = "ssdp_st"
+ATTR_SSDP_NT = "ssdp_nt"
+ATTR_SSDP_UDN = "ssdp_udn"
+ATTR_SSDP_USN = "ssdp_usn"
+ATTR_SSDP_EXT = "ssdp_ext"
+ATTR_SSDP_SERVER = "ssdp_server"
+ATTR_SSDP_BOOTID = "BOOTID.UPNP.ORG"
+ATTR_SSDP_NEXTBOOTID = "NEXTBOOTID.UPNP.ORG"
+
+# Attributes for accessing info added by Home Assistant
+ATTR_HA_MATCHING_DOMAINS = "x_homeassistant_matching_domains"
+
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
 
-async def async_setup(hass, config):
+def _format_err(name: str, *args: Any) -> str:
+    """Format error message."""
+    return f"Exception in SSDP callback {name}: {args}"
+
+
+@bind_hass
+async def async_register_callback(
+    hass: HomeAssistant,
+    callback: Callable[
+        [_SsdpServiceInfo, SsdpChange], Coroutine[Any, Any, None] | None
+    ],
+    match_dict: dict[str, str] | None = None,
+) -> Callable[[], None]:
+    """Register to receive a callback on ssdp broadcast.
+
+    Returns a callback that can be used to cancel the registration.
+    """
+    scanner: Scanner = hass.data[DOMAIN][SSDP_SCANNER]
+    job = HassJob(
+        catch_log_exception(
+            callback,
+            partial(_format_err, str(callback)),
+        ),
+        f"ssdp callback {match_dict}",
+    )
+    return await scanner.async_register_callback(job, match_dict)
+
+
+@bind_hass
+async def async_get_discovery_info_by_udn_st(
+    hass: HomeAssistant, udn: str, st: str
+) -> _SsdpServiceInfo | None:
+    """Fetch the discovery info cache."""
+    scanner: Scanner = hass.data[DOMAIN][SSDP_SCANNER]
+    return await scanner.async_get_discovery_info_by_udn_st(udn, st)
+
+
+@bind_hass
+async def async_get_discovery_info_by_st(
+    hass: HomeAssistant, st: str
+) -> list[_SsdpServiceInfo]:
+    """Fetch all the entries matching the st."""
+    scanner: Scanner = hass.data[DOMAIN][SSDP_SCANNER]
+    return await scanner.async_get_discovery_info_by_st(st)
+
+
+@bind_hass
+async def async_get_discovery_info_by_udn(
+    hass: HomeAssistant, udn: str
+) -> list[_SsdpServiceInfo]:
+    """Fetch all the entries matching the udn."""
+    scanner: Scanner = hass.data[DOMAIN][SSDP_SCANNER]
+    return await scanner.async_get_discovery_info_by_udn(udn)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the SSDP integration."""
 
-    async def initialize():
-        scanner = Scanner(hass)
-        await scanner.async_scan(None)
-        async_track_time_interval(hass, scanner.async_scan, SCAN_INTERVAL)
+    integration_matchers = IntegrationMatchers()
+    integration_matchers.async_setup(await async_get_ssdp(hass))
 
-    hass.loop.create_task(initialize())
-
-    return True
-
-
-class Scanner:
-    """Class to manage SSDP scanning."""
-
-    def __init__(self, hass):
-        """Initialize class."""
-        self.hass = hass
-        self.seen = set()
-        self._description_cache = {}
-
-    async def async_scan(self, _):
-        """Scan for new entries."""
-        _LOGGER.debug("Scanning")
-        # Run 3 times as packets can get lost
-        for _ in range(3):
-            entries = await self.hass.async_add_executor_job(ssdp.scan)
-            await self._process_entries(entries)
-
-        # We clear the cache after each run. We track discovered entries
-        # so will never need a description twice.
-        self._description_cache.clear()
-
-    async def _process_entries(self, entries):
-        """Process SSDP entries."""
-        tasks = []
-
-        for entry in entries:
-            key = (entry.st, entry.location)
-
-            if key in self.seen:
-                continue
-
-            self.seen.add(key)
-
-            tasks.append(self._process_entry(entry))
-
-        if not tasks:
-            return
-
-        to_load = [
-            result for result in await asyncio.gather(*tasks) if result is not None
-        ]
-
-        if not to_load:
-            return
-
-        tasks = []
-
-        for entry, info, domains in to_load:
-            for domain in domains:
-                _LOGGER.debug("Discovered %s at %s", domain, entry.location)
-                tasks.append(
-                    self.hass.config_entries.flow.async_init(
-                        domain, context={"source": DOMAIN}, data=info
-                    )
-                )
-
-        await asyncio.wait(tasks)
-
-    async def _process_entry(self, entry):
-        """Process a single entry."""
-
-        info = {"st": entry.st}
-
-        if entry.location:
-
-            # Multiple entries usually share same location. Make sure
-            # we fetch it only once.
-            info_req = self._description_cache.get(entry.location)
-
-            if info_req is None:
-                info_req = self._description_cache[
-                    entry.location
-                ] = self.hass.async_create_task(self._fetch_description(entry.location))
-
-            info.update(await info_req)
-
-        domains = set()
-        for domain, matchers in SSDP.items():
-            for matcher in matchers:
-                if all(info.get(k) == v for (k, v) in matcher.items()):
-                    domains.add(domain)
-
-        if domains:
-            return (entry, info_from_entry(entry, info), domains)
-
-        return None
-
-    async def _fetch_description(self, xml_location):
-        """Fetch an XML description."""
-        session = self.hass.helpers.aiohttp_client.async_get_clientsession()
-        try:
-            resp = await session.get(xml_location, timeout=5)
-            xml = await resp.text()
-
-            # Samsung Smart TV sometimes returns an empty document the
-            # first time. Retry once.
-            if not xml:
-                resp = await session.get(xml_location, timeout=5)
-                xml = await resp.text()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            _LOGGER.debug("Error fetching %s: %s", xml_location, err)
-            return {}
-
-        try:
-            tree = ElementTree.fromstring(xml)
-        except ElementTree.ParseError as err:
-            _LOGGER.debug("Error parsing %s: %s", xml_location, err)
-            return {}
-
-        return util.etree_to_dict(tree).get("root", {}).get("device", {})
-
-
-def info_from_entry(entry, device_info):
-    """Get most important info from an entry."""
-    url = urlparse(entry.location)
-    info = {
-        ATTR_HOST: url.hostname,
-        ATTR_PORT: url.port,
-        ATTR_SSDP_DESCRIPTION: entry.location,
-        ATTR_ST: entry.st,
+    scanner = Scanner(hass, integration_matchers)
+    server = Server(hass)
+    hass.data[DOMAIN] = {
+        SSDP_SCANNER: scanner,
+        UPNP_SERVER: server,
     }
 
-    if device_info:
-        info[ATTR_NAME] = device_info.get("friendlyName")
-        info[ATTR_MODEL_NAME] = device_info.get("modelName")
-        info[ATTR_MODEL_NUMBER] = device_info.get("modelNumber")
-        info[ATTR_SERIAL] = device_info.get("serialNumber")
-        info[ATTR_MANUFACTURER] = device_info.get("manufacturer")
-        info[ATTR_MANUFACTURERURL] = device_info.get("manufacturerURL")
-        info[ATTR_UDN] = device_info.get("UDN")
-        info[ATTR_UPNP_DEVICE_TYPE] = device_info.get("deviceType")
-        info[ATTR_PRESENTATIONURL] = device_info.get("presentationURL")
+    await scanner.async_start()
+    await server.async_start()
+    websocket_api.async_setup(hass)
 
-    return info
+    return True

@@ -1,85 +1,59 @@
 """Support for Axis devices."""
 
-import voluptuous as vol
+import logging
 
-from homeassistant import config_entries
-from homeassistant.const import (
-    CONF_DEVICE,
-    CONF_MAC,
-    CONF_NAME,
-    CONF_TRIGGER_TIME,
-    EVENT_HOMEASSISTANT_STOP,
-)
-from homeassistant.helpers import config_validation as cv
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
-from .config_flow import DEVICE_SCHEMA
-from .const import CONF_CAMERA, CONF_EVENTS, DEFAULT_TRIGGER_TIME, DOMAIN
-from .device import AxisNetworkDevice, get_device
+from .const import PLATFORMS
+from .errors import AuthenticationRequired, CannotConnect
+from .hub import AxisHub, get_axis_api
 
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: cv.schema_with_slug_keys(DEVICE_SCHEMA)}, extra=vol.ALLOW_EXTRA
-)
+_LOGGER = logging.getLogger(__name__)
+
+type AxisConfigEntry = ConfigEntry[AxisHub]
 
 
-async def async_setup(hass, config):
-    """Set up for Axis devices."""
-    if not hass.config_entries.async_entries(DOMAIN) and DOMAIN in config:
+async def async_setup_entry(hass: HomeAssistant, config_entry: AxisConfigEntry) -> bool:
+    """Set up the Axis integration."""
+    try:
+        api = await get_axis_api(hass, config_entry.data)
+    except CannotConnect as err:
+        raise ConfigEntryNotReady from err
+    except AuthenticationRequired as err:
+        raise ConfigEntryAuthFailed from err
 
-        for device_name, device_config in config[DOMAIN].items():
+    hub = config_entry.runtime_data = AxisHub(hass, config_entry, api)
+    await hub.async_update_device_registry()
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    hub.setup()
 
-            if CONF_NAME not in device_config:
-                device_config[CONF_NAME] = device_name
-
-            hass.async_create_task(
-                hass.config_entries.flow.async_init(
-                    DOMAIN,
-                    context={"source": config_entries.SOURCE_IMPORT},
-                    data=device_config,
-                )
-            )
-
-    return True
-
-
-async def async_setup_entry(hass, config_entry):
-    """Set up the Axis component."""
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-
-    if not config_entry.options:
-        await async_populate_options(hass, config_entry)
-
-    device = AxisNetworkDevice(hass, config_entry)
-
-    if not await device.async_setup():
-        return False
-
-    hass.data[DOMAIN][device.serial] = device
-
-    await device.async_update_device_registry()
-
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, device.shutdown)
+    config_entry.async_on_unload(
+        config_entry.add_update_listener(hub.async_new_address_callback)
+    )
+    config_entry.async_on_unload(hub.teardown)
+    config_entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, hub.shutdown)
+    )
 
     return True
 
 
-async def async_unload_entry(hass, config_entry):
+async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload Axis device config entry."""
-    device = hass.data[DOMAIN].pop(config_entry.data[CONF_MAC])
-    return await device.async_reset()
+    return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
 
 
-async def async_populate_options(hass, config_entry):
-    """Populate default options for device."""
-    device = await get_device(hass, config_entry.data[CONF_DEVICE])
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Migrate old entry."""
+    _LOGGER.debug("Migrating from version %s", config_entry.version)
 
-    supported_formats = device.vapix.params.image_format
-    camera = bool(supported_formats)
+    if config_entry.version != 3:
+        # Home Assistant 2023.2
+        hass.config_entries.async_update_entry(config_entry, version=3)
 
-    options = {
-        CONF_CAMERA: camera,
-        CONF_EVENTS: True,
-        CONF_TRIGGER_TIME: DEFAULT_TRIGGER_TIME,
-    }
+    _LOGGER.debug("Migration to version %s successful", config_entry.version)
 
-    hass.config_entries.async_update_entry(config_entry, options=options)
+    return True

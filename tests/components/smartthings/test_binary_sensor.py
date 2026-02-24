@@ -1,101 +1,101 @@
-"""
-Test for the SmartThings binary_sensor platform.
+"""Test for the SmartThings binary_sensor platform."""
 
-The only mocking required is of the underlying SmartThings API object so
-real HTTP calls are not initiated during testing.
-"""
-from pysmartthings import ATTRIBUTES, CAPABILITIES, Attribute, Capability
+from unittest.mock import AsyncMock
 
-from homeassistant.components.binary_sensor import (
-    DEVICE_CLASSES,
-    DOMAIN as BINARY_SENSOR_DOMAIN,
+from pysmartthings import Attribute, Capability
+from pysmartthings.models import HealthStatus
+import pytest
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+
+from . import (
+    setup_integration,
+    snapshot_smartthings_entities,
+    trigger_health_update,
+    trigger_update,
 )
-from homeassistant.components.smartthings import binary_sensor
-from homeassistant.components.smartthings.const import DOMAIN, SIGNAL_SMARTTHINGS_UPDATE
-from homeassistant.const import ATTR_FRIENDLY_NAME
-from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .conftest import setup_platform
+from tests.common import MockConfigEntry
 
 
-async def test_mapping_integrity():
-    """Test ensures the map dicts have proper integrity."""
-    # Ensure every CAPABILITY_TO_ATTRIB key is in CAPABILITIES
-    # Ensure every CAPABILITY_TO_ATTRIB value is in ATTRIB_TO_CLASS keys
-    for capability, attrib in binary_sensor.CAPABILITY_TO_ATTRIB.items():
-        assert capability in CAPABILITIES, capability
-        assert attrib in ATTRIBUTES, attrib
-        assert attrib in binary_sensor.ATTRIB_TO_CLASS.keys(), attrib
-    # Ensure every ATTRIB_TO_CLASS value is in DEVICE_CLASSES
-    for attrib, device_class in binary_sensor.ATTRIB_TO_CLASS.items():
-        assert attrib in ATTRIBUTES, attrib
-        assert device_class in DEVICE_CLASSES, device_class
+async def test_all_entities(
+    hass: HomeAssistant,
+    snapshot: SnapshotAssertion,
+    devices: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test all entities."""
+    await setup_integration(hass, mock_config_entry)
 
-
-async def test_async_setup_platform():
-    """Test setup platform does nothing (it uses config entries)."""
-    await binary_sensor.async_setup_platform(None, None, None)
-
-
-async def test_entity_state(hass, device_factory):
-    """Tests the state attributes properly match the light types."""
-    device = device_factory(
-        "Motion Sensor 1", [Capability.motion_sensor], {Attribute.motion: "inactive"}
+    snapshot_smartthings_entities(
+        hass, entity_registry, snapshot, Platform.BINARY_SENSOR
     )
-    await setup_platform(hass, BINARY_SENSOR_DOMAIN, devices=[device])
-    state = hass.states.get("binary_sensor.motion_sensor_1_motion")
-    assert state.state == "off"
-    assert state.attributes[ATTR_FRIENDLY_NAME] == device.label + " " + Attribute.motion
 
 
-async def test_entity_and_device_attributes(hass, device_factory):
-    """Test the attributes of the entity are correct."""
-    # Arrange
-    device = device_factory(
-        "Motion Sensor 1", [Capability.motion_sensor], {Attribute.motion: "inactive"}
+@pytest.mark.parametrize("device_fixture", ["da_ref_normal_000001"])
+async def test_state_update(
+    hass: HomeAssistant,
+    devices: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test state update."""
+    await setup_integration(hass, mock_config_entry)
+
+    assert hass.states.get("binary_sensor.refrigerator_fridge_door").state == STATE_OFF
+
+    await trigger_update(
+        hass,
+        devices,
+        "7db87911-7dce-1cf2-7119-b953432a2f09",
+        Capability.CONTACT_SENSOR,
+        Attribute.CONTACT,
+        "open",
+        component="cooler",
     )
-    entity_registry = await hass.helpers.entity_registry.async_get_registry()
-    device_registry = await hass.helpers.device_registry.async_get_registry()
-    # Act
-    await setup_platform(hass, BINARY_SENSOR_DOMAIN, devices=[device])
-    # Assert
-    entry = entity_registry.async_get("binary_sensor.motion_sensor_1_motion")
-    assert entry
-    assert entry.unique_id == device.device_id + "." + Attribute.motion
-    entry = device_registry.async_get_device({(DOMAIN, device.device_id)}, [])
-    assert entry
-    assert entry.name == device.label
-    assert entry.model == device.device_type_name
-    assert entry.manufacturer == "Unavailable"
+
+    assert hass.states.get("binary_sensor.refrigerator_fridge_door").state == STATE_ON
 
 
-async def test_update_from_signal(hass, device_factory):
-    """Test the binary_sensor updates when receiving a signal."""
-    # Arrange
-    device = device_factory(
-        "Motion Sensor 1", [Capability.motion_sensor], {Attribute.motion: "inactive"}
+@pytest.mark.parametrize("device_fixture", ["da_ref_normal_000001"])
+async def test_availability(
+    hass: HomeAssistant,
+    devices: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test availability."""
+    await setup_integration(hass, mock_config_entry)
+
+    assert hass.states.get("binary_sensor.refrigerator_fridge_door").state == STATE_OFF
+
+    await trigger_health_update(
+        hass, devices, "7db87911-7dce-1cf2-7119-b953432a2f09", HealthStatus.OFFLINE
     )
-    await setup_platform(hass, BINARY_SENSOR_DOMAIN, devices=[device])
-    device.status.apply_attribute_update(
-        "main", Capability.motion_sensor, Attribute.motion, "active"
+
+    assert (
+        hass.states.get("binary_sensor.refrigerator_fridge_door").state
+        == STATE_UNAVAILABLE
     )
-    # Act
-    async_dispatcher_send(hass, SIGNAL_SMARTTHINGS_UPDATE, [device.device_id])
-    # Assert
-    await hass.async_block_till_done()
-    state = hass.states.get("binary_sensor.motion_sensor_1_motion")
-    assert state is not None
-    assert state.state == "on"
+
+    await trigger_health_update(
+        hass, devices, "7db87911-7dce-1cf2-7119-b953432a2f09", HealthStatus.ONLINE
+    )
+
+    assert hass.states.get("binary_sensor.refrigerator_fridge_door").state == STATE_OFF
 
 
-async def test_unload_config_entry(hass, device_factory):
-    """Test the binary_sensor is removed when the config entry is unloaded."""
-    # Arrange
-    device = device_factory(
-        "Motion Sensor 1", [Capability.motion_sensor], {Attribute.motion: "inactive"}
+@pytest.mark.parametrize("device_fixture", ["da_ref_normal_000001"])
+async def test_availability_at_start(
+    hass: HomeAssistant,
+    unavailable_device: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test unavailable at boot."""
+    await setup_integration(hass, mock_config_entry)
+    assert (
+        hass.states.get("binary_sensor.refrigerator_fridge_door").state
+        == STATE_UNAVAILABLE
     )
-    config_entry = await setup_platform(hass, BINARY_SENSOR_DOMAIN, devices=[device])
-    # Act
-    await hass.config_entries.async_forward_entry_unload(config_entry, "binary_sensor")
-    # Assert
-    assert not hass.states.get("binary_sensor.motion_sensor_1_motion")

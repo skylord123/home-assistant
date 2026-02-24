@@ -1,6 +1,8 @@
 """Interfaces with Egardia/Woonveilig alarm control panel."""
+
 import logging
 
+from pythonegardia import egardiadevice, egardiaserver
 import requests
 import voluptuous as vol
 
@@ -11,9 +13,12 @@ from homeassistant.const import (
     CONF_PORT,
     CONF_USERNAME,
     EVENT_HOMEASSISTANT_STOP,
+    Platform,
 )
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ DEFAULT_REPORT_SERVER_PORT = 52010
 DEFAULT_VERSION = "GATE-01"
 DOMAIN = "egardia"
 
-EGARDIA_DEVICE = "egardiadevice"
+EGARDIA_DEVICE: HassKey[egardiadevice.EgardiaDevice] = HassKey(DOMAIN)
 EGARDIA_NAME = "egardianame"
 EGARDIA_REPORT_SERVER_CODES = "egardia_rs_codes"
 EGARDIA_REPORT_SERVER_ENABLED = "egardia_rs_enabled"
@@ -76,10 +81,8 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-def setup(hass, config):
+def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Egardia platform."""
-    from pythonegardia import egardiadevice
-    from pythonegardia import egardiaserver
 
     conf = config[DOMAIN]
     username = conf.get(CONF_USERNAME)
@@ -110,8 +113,8 @@ def setup(hass, config):
                 server = egardiaserver.EgardiaServer("", rs_port)
                 bound = server.bind()
                 if not bound:
-                    raise OSError(
-                        "Binding error occurred while " + "starting EgardiaServer."
+                    raise OSError(  # noqa: TRY301
+                        "Binding error occurred while starting EgardiaServer."
                     )
                 hass.data[EGARDIA_SERVER] = server
                 server.start()
@@ -120,7 +123,7 @@ def setup(hass, config):
                 """Handle Home Assistant stop event."""
                 server.stop()
 
-            # listen to home assistant stop event
+            # listen to Home Assistant stop event
             hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, handle_stop_event)
 
         except OSError:
@@ -128,13 +131,13 @@ def setup(hass, config):
             return False
 
     discovery.load_platform(
-        hass, "alarm_control_panel", DOMAIN, discovered=conf, hass_config=config
+        hass, Platform.ALARM_CONTROL_PANEL, DOMAIN, discovered=conf, hass_config=config
     )
 
     # Get the sensors from the device and add those
     sensors = device.getsensors()
     discovery.load_platform(
-        hass, "binary_sensor", DOMAIN, {ATTR_DISCOVER_DEVICES: sensors}, config
+        hass, Platform.BINARY_SENSOR, DOMAIN, {ATTR_DISCOVER_DEVICES: sensors}, config
     )
 
     return True

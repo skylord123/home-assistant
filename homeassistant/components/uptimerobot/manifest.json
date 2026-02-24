@@ -1,12 +1,12 @@
 {
   "domain": "uptimerobot",
-  "name": "Uptimerobot",
+  "name": "UptimeRobot",
+  "codeowners": ["@ludeeus", "@chemelli74"],
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/uptimerobot",
-  "requirements": [
-    "pyuptimerobot==0.0.5"
-  ],
-  "dependencies": [],
-  "codeowners": [
-    "@ludeeus"
-  ]
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["pyuptimerobot"],
+  "quality_scale": "bronze",
+  "requirements": ["pyuptimerobot==24.0.1"]
 }

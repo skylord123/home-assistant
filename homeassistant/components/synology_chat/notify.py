@@ -1,22 +1,28 @@
 """SynologyChat platform for notify component."""
+
+from __future__ import annotations
+
+from http import HTTPStatus
 import json
 import logging
+from typing import Any
 
 import requests
 import voluptuous as vol
 
-from homeassistant.const import CONF_RESOURCE, CONF_VERIFY_SSL
-import homeassistant.helpers.config_validation as cv
-
 from homeassistant.components.notify import (
     ATTR_DATA,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
+from homeassistant.const import CONF_RESOURCE, CONF_VERIFY_SSL
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 ATTR_FILE_URL = "file_url"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_RESOURCE): cv.url,
         vol.Optional(CONF_VERIFY_SSL, default=True): cv.boolean,
@@ -26,7 +32,11 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 _LOGGER = logging.getLogger(__name__)
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> SynologyChatNotificationService:
     """Get the Synology Chat notification service."""
     resource = config.get(CONF_RESOURCE)
     verify_ssl = config.get(CONF_VERIFY_SSL)
@@ -42,7 +52,7 @@ class SynologyChatNotificationService(BaseNotificationService):
         self._resource = resource
         self._verify_ssl = verify_ssl
 
-    def send_message(self, message="", **kwargs):
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to a user."""
         data = {"text": message}
 
@@ -52,13 +62,13 @@ class SynologyChatNotificationService(BaseNotificationService):
         if file_url:
             data["file_url"] = file_url
 
-        to_send = "payload={}".format(json.dumps(data))
+        to_send = f"payload={json.dumps(data)}"
 
         response = requests.post(
             self._resource, data=to_send, timeout=10, verify=self._verify_ssl
         )
 
-        if response.status_code not in (200, 201):
+        if response.status_code not in (HTTPStatus.OK, HTTPStatus.CREATED):
             _LOGGER.exception(
                 "Error sending message. Response %d: %s:",
                 response.status_code,

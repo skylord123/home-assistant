@@ -1,13 +1,11 @@
 {
-    "domain": "adguard",
-    "name": "AdGuard Home",
-    "config_flow": true,
-    "documentation": "https://www.home-assistant.io/integrations/adguard",
-    "requirements": [
-        "adguardhome==0.3.0"
-    ],
-    "dependencies": [],
-    "codeowners": [
-        "@frenck"
-    ]
+  "domain": "adguard",
+  "name": "AdGuard Home",
+  "codeowners": ["@frenck"],
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/adguard",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "loggers": ["adguardhome"],
+  "requirements": ["adguardhome==0.8.1"]
 }

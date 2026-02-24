@@ -1,70 +1,124 @@
-"""Support for KNX scenes."""
-import voluptuous as vol
-from xknx.devices import Scene as XknxScene
+"""Support for KNX scene entities."""
 
-from homeassistant.components.scene import CONF_PLATFORM, Scene
-from homeassistant.const import CONF_ADDRESS, CONF_NAME
-from homeassistant.core import callback
-import homeassistant.helpers.config_validation as cv
+from __future__ import annotations
 
-from . import ATTR_DISCOVER_DEVICES, DATA_KNX
+from typing import Any
 
-CONF_SCENE_NUMBER = "scene_number"
+from xknx.devices import Device as XknxDevice, Scene as XknxScene
 
-DEFAULT_NAME = "KNX SCENE"
-PLATFORM_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_PLATFORM): "knx",
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Required(CONF_ADDRESS): cv.string,
-        vol.Required(CONF_SCENE_NUMBER): cv.positive_int,
-    }
+from homeassistant import config_entries
+from homeassistant.components.scene import BaseScene
+from homeassistant.const import CONF_ENTITY_CATEGORY, CONF_NAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    async_get_current_platform,
 )
+from homeassistant.helpers.typing import ConfigType
+
+from .const import DOMAIN, KNX_ADDRESS, KNX_MODULE_KEY, SceneConf
+from .entity import (
+    KnxUiEntity,
+    KnxUiEntityPlatformController,
+    KnxYamlEntity,
+    _KnxEntityBase,
+)
+from .knx_module import KNXModule
+from .schema import SceneSchema
+from .storage.const import CONF_ENTITY, CONF_GA_SCENE
+from .storage.util import ConfigExtractor
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the scenes for KNX platform."""
-    if discovery_info is not None:
-        async_add_entities_discovery(hass, discovery_info, async_add_entities)
-    else:
-        async_add_entities_config(hass, config, async_add_entities)
-
-
-@callback
-def async_add_entities_discovery(hass, discovery_info, async_add_entities):
-    """Set up scenes for KNX platform configured via xknx.yaml."""
-    entities = []
-    for device_name in discovery_info[ATTR_DISCOVER_DEVICES]:
-        device = hass.data[DATA_KNX].xknx.devices[device_name]
-        entities.append(KNXScene(device))
-    async_add_entities(entities)
-
-
-@callback
-def async_add_entities_config(hass, config, async_add_entities):
-    """Set up scene for KNX platform configured within platform."""
-    scene = XknxScene(
-        hass.data[DATA_KNX].xknx,
-        name=config[CONF_NAME],
-        group_address=config[CONF_ADDRESS],
-        scene_number=config[CONF_SCENE_NUMBER],
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: config_entries.ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up scene(s) for KNX platform."""
+    knx_module = hass.data[KNX_MODULE_KEY]
+    platform = async_get_current_platform()
+    knx_module.config_store.add_platform(
+        platform=Platform.SCENE,
+        controller=KnxUiEntityPlatformController(
+            knx_module=knx_module,
+            entity_platform=platform,
+            entity_class=KnxUiScene,
+        ),
     )
-    hass.data[DATA_KNX].xknx.devices.add(scene)
-    async_add_entities([KNXScene(scene)])
+
+    entities: list[KnxYamlEntity | KnxUiEntity] = []
+    if yaml_platform_config := knx_module.config_yaml.get(Platform.SCENE):
+        entities.extend(
+            KnxYamlScene(knx_module, entity_config)
+            for entity_config in yaml_platform_config
+        )
+    if ui_config := knx_module.config_store.data["entities"].get(Platform.SCENE):
+        entities.extend(
+            KnxUiScene(knx_module, unique_id, config)
+            for unique_id, config in ui_config.items()
+        )
+    if entities:
+        async_add_entities(entities)
 
 
-class KNXScene(Scene):
+class _KnxScene(BaseScene, _KnxEntityBase):
     """Representation of a KNX scene."""
 
-    def __init__(self, scene):
-        """Init KNX scene."""
-        self.scene = scene
+    _device: XknxScene
 
-    @property
-    def name(self):
-        """Return the name of the scene."""
-        return self.scene.name
-
-    async def async_activate(self):
+    async def _async_activate(self, **kwargs: Any) -> None:
         """Activate the scene."""
-        await self.scene.run()
+        await self._device.run()
+
+    def after_update_callback(self, device: XknxDevice) -> None:
+        """Call after device was updated."""
+        self._async_record_activation()
+        super().after_update_callback(device)
+
+
+class KnxYamlScene(_KnxScene, KnxYamlEntity):
+    """Representation of a KNX scene configured from YAML."""
+
+    _device: XknxScene
+
+    def __init__(self, knx_module: KNXModule, config: ConfigType) -> None:
+        """Initialize KNX scene."""
+        super().__init__(
+            knx_module=knx_module,
+            device=XknxScene(
+                xknx=knx_module.xknx,
+                name=config[CONF_NAME],
+                group_address=config[KNX_ADDRESS],
+                scene_number=config[SceneSchema.CONF_SCENE_NUMBER],
+            ),
+        )
+        self._attr_entity_category = config.get(CONF_ENTITY_CATEGORY)
+        self._attr_unique_id = (
+            f"{self._device.scene_value.group_address}_{self._device.scene_number}"
+        )
+
+
+class KnxUiScene(_KnxScene, KnxUiEntity):
+    """Representation of a KNX scene configured from the UI."""
+
+    _device: XknxScene
+
+    def __init__(
+        self,
+        knx_module: KNXModule,
+        unique_id: str,
+        config: ConfigType,
+    ) -> None:
+        """Initialize KNX scene."""
+        super().__init__(
+            knx_module=knx_module,
+            unique_id=unique_id,
+            entity_config=config[CONF_ENTITY],
+        )
+        knx_conf = ConfigExtractor(config[DOMAIN])
+        self._device = XknxScene(
+            xknx=knx_module.xknx,
+            name=config[CONF_ENTITY][CONF_NAME],
+            group_address=knx_conf.get_write(CONF_GA_SCENE),
+            scene_number=knx_conf.get(SceneConf.SCENE_NUMBER),
+        )

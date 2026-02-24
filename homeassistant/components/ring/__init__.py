@@ -1,98 +1,175 @@
 """Support for Ring Doorbell/Chimes."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any, cast
+import uuid
 
-from datetime import timedelta
-from requests.exceptions import ConnectTimeout, HTTPError
-import voluptuous as vol
+from ring_doorbell import Auth, Ring
 
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, CONF_SCAN_INTERVAL
-from homeassistant.helpers.event import track_time_interval
-from homeassistant.helpers.dispatcher import dispatcher_send
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
+from homeassistant.const import APPLICATION_NAME, CONF_DEVICE_ID, CONF_TOKEN
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .const import CONF_LISTEN_CREDENTIALS, DOMAIN, PLATFORMS
+from .coordinator import (
+    RingConfigEntry,
+    RingData,
+    RingDataCoordinator,
+    RingListenCoordinator,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTRIBUTION = "Data provided by Ring.com"
 
-NOTIFICATION_ID = "ring_notification"
-NOTIFICATION_TITLE = "Ring Setup"
+def get_auth_user_agent() -> str:
+    """Return user-agent for Auth instantiation.
 
-DATA_RING_DOORBELLS = "ring_doorbells"
-DATA_RING_STICKUP_CAMS = "ring_stickup_cams"
-DATA_RING_CHIMES = "ring_chimes"
+    user_agent will be the display name in the ring.com authorised devices.
+    """
+    return f"{APPLICATION_NAME}/{DOMAIN}-integration"
 
-DOMAIN = "ring"
-DEFAULT_CACHEDB = ".ring_cache.pickle"
-DEFAULT_ENTITY_NAMESPACE = "ring"
-SIGNAL_UPDATE_RING = "ring_update"
 
-SCAN_INTERVAL = timedelta(seconds=10)
+async def async_setup_entry(hass: HomeAssistant, entry: RingConfigEntry) -> bool:
+    """Set up a config entry."""
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_USERNAME): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
-                vol.Optional(CONF_SCAN_INTERVAL, default=SCAN_INTERVAL): cv.time_period,
-            }
+    def token_updater(token: dict[str, Any]) -> None:
+        """Handle from async context when token is updated."""
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_TOKEN: token},
         )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
 
-
-def setup(hass, config):
-    """Set up the Ring component."""
-    conf = config[DOMAIN]
-    username = conf[CONF_USERNAME]
-    password = conf[CONF_PASSWORD]
-    scan_interval = conf[CONF_SCAN_INTERVAL]
-
-    try:
-        from ring_doorbell import Ring
-
-        cache = hass.config.path(DEFAULT_CACHEDB)
-        ring = Ring(username=username, password=password, cache_file=cache)
-        if not ring.is_connected:
-            return False
-        hass.data[DATA_RING_CHIMES] = chimes = ring.chimes
-        hass.data[DATA_RING_DOORBELLS] = doorbells = ring.doorbells
-        hass.data[DATA_RING_STICKUP_CAMS] = stickup_cams = ring.stickup_cams
-
-        ring_devices = chimes + doorbells + stickup_cams
-
-    except (ConnectTimeout, HTTPError) as ex:
-        _LOGGER.error("Unable to connect to Ring service: %s", str(ex))
-        hass.components.persistent_notification.create(
-            "Error: {}<br />"
-            "You will need to restart hass after fixing."
-            "".format(ex),
-            title=NOTIFICATION_TITLE,
-            notification_id=NOTIFICATION_ID,
+    def listen_credentials_updater(token: dict[str, Any]) -> None:
+        """Handle from async context when token is updated."""
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_LISTEN_CREDENTIALS: token},
         )
-        return False
 
-    def service_hub_refresh(service):
-        hub_refresh()
+    user_agent = get_auth_user_agent()
+    client_session = async_get_clientsession(hass)
+    auth = Auth(
+        user_agent,
+        entry.data[CONF_TOKEN],
+        token_updater,
+        hardware_id=entry.data[CONF_DEVICE_ID],
+        http_client_session=client_session,
+    )
+    ring = Ring(auth)
 
-    def timer_hub_refresh(event_time):
-        hub_refresh()
+    devices_coordinator = RingDataCoordinator(hass, entry, ring)
+    listen_credentials = entry.data.get(CONF_LISTEN_CREDENTIALS)
+    listen_coordinator = RingListenCoordinator(
+        hass, entry, ring, listen_credentials, listen_credentials_updater
+    )
 
-    def hub_refresh():
-        """Call ring to refresh information."""
-        _LOGGER.debug("Updating Ring Hub component")
+    await devices_coordinator.async_config_entry_first_refresh()
 
-        for camera in ring_devices:
-            _LOGGER.debug("Updating camera %s", camera.name)
-            camera.update()
+    entry.runtime_data = RingData(
+        api=ring,
+        devices=ring.devices(),
+        devices_coordinator=devices_coordinator,
+        listen_coordinator=listen_coordinator,
+    )
 
-        dispatcher_send(hass, SIGNAL_UPDATE_RING)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # register service
-    hass.services.register(DOMAIN, "update", service_hub_refresh)
+    return True
 
-    # register scan interval for ring
-    track_time_interval(hass, timer_hub_refresh, scan_interval)
+
+async def async_unload_entry(hass: HomeAssistant, entry: RingConfigEntry) -> bool:
+    """Unload Ring entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: RingConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: RingConfigEntry) -> bool:
+    """Migrate old config entry."""
+    entry_version = entry.version
+    entry_minor_version = entry.minor_version
+    entry_id = entry.entry_id
+
+    new_minor_version = 2
+    if entry_version == 1 and entry_minor_version == 1:
+        _LOGGER.debug(
+            "Migrating from version %s.%s", entry_version, entry_minor_version
+        )
+        # Migrate non-str unique ids
+        # This step used to run unconditionally from async_setup_entry
+        entity_registry = er.async_get(hass)
+
+        @callback
+        def _async_str_unique_id_migrator(
+            entity_entry: er.RegistryEntry,
+        ) -> dict[str, str] | None:
+            # Old format for camera and light was int
+            unique_id = cast(str | int, entity_entry.unique_id)
+            if isinstance(unique_id, int):
+                new_unique_id = str(unique_id)
+                if existing_entity_id := entity_registry.async_get_entity_id(
+                    entity_entry.domain, entity_entry.platform, new_unique_id
+                ):
+                    _LOGGER.error(
+                        "Cannot migrate to unique_id '%s', already exists for '%s', "
+                        "You may have to delete unavailable ring entities",
+                        new_unique_id,
+                        existing_entity_id,
+                    )
+                    return None
+                _LOGGER.debug("Fixing non string unique id %s", entity_entry.unique_id)
+                return {"new_unique_id": new_unique_id}
+            return None
+
+        await er.async_migrate_entries(hass, entry_id, _async_str_unique_id_migrator)
+
+        # Migrate the hardware id
+        hardware_id = str(uuid.uuid4())
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_DEVICE_ID: hardware_id},
+            minor_version=new_minor_version,
+        )
+        _LOGGER.debug(
+            "Migration to version %s.%s complete", entry_version, new_minor_version
+        )
+
+    entry_minor_version = entry.minor_version
+    new_minor_version = 3
+    if entry_version == 1 and entry_minor_version == 2:
+        _LOGGER.debug(
+            "Migrating from version %s.%s", entry_version, entry_minor_version
+        )
+
+        @callback
+        def _async_camera_unique_id_migrator(
+            entity_entry: er.RegistryEntry,
+        ) -> dict[str, str] | None:
+            # Migrate camera unique ids to append -last
+            if entity_entry.domain == CAMERA_DOMAIN and not isinstance(
+                cast(str | int, entity_entry.unique_id), int
+            ):
+                new_unique_id = f"{entity_entry.unique_id}-last_recording"
+                return {"new_unique_id": new_unique_id}
+            return None
+
+        await er.async_migrate_entries(hass, entry_id, _async_camera_unique_id_migrator)
+
+        hass.config_entries.async_update_entry(
+            entry,
+            minor_version=new_minor_version,
+        )
+        _LOGGER.debug(
+            "Migration to version %s.%s complete", entry_version, new_minor_version
+        )
 
     return True

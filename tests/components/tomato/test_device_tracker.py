@@ -1,28 +1,31 @@
 """The tests for the Tomato device tracker platform."""
+
 from unittest import mock
+
 import pytest
 import requests
 import requests_mock
 import voluptuous as vol
 
-from homeassistant.components.device_tracker import DOMAIN
-import homeassistant.components.tomato.device_tracker as tomato
+from homeassistant.components.device_tracker import DOMAIN as DEVICE_TRACKER_DOMAIN
+from homeassistant.components.tomato import device_tracker as tomato
 from homeassistant.const import (
     CONF_HOST,
-    CONF_USERNAME,
     CONF_PASSWORD,
+    CONF_PLATFORM,
     CONF_PORT,
     CONF_SSL,
-    CONF_PLATFORM,
+    CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
+from homeassistant.core import HomeAssistant
 
 
 def mock_session_response(*args, **kwargs):
     """Mock data generation for session response."""
 
     class MockSessionResponse:
-        def __init__(self, text, status_code):
+        def __init__(self, text, status_code) -> None:
             self.text = text
             self.status_code = status_code
 
@@ -50,7 +53,7 @@ def mock_session_response(*args, **kwargs):
 def mock_exception_logger():
     """Mock pyunifi."""
     with mock.patch(
-        "homeassistant.components.tomato.device_tracker" "._LOGGER.exception"
+        "homeassistant.components.tomato.device_tracker._LOGGER.exception"
     ) as mock_exception_logger:
         yield mock_exception_logger
 
@@ -62,12 +65,12 @@ def mock_session_send():
         yield mock_session_send
 
 
-def test_config_missing_optional_params(hass, mock_session_send):
+def test_config_missing_optional_params(hass: HomeAssistant, mock_session_send) -> None:
     """Test the setup without optional parameters."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "password",
@@ -88,12 +91,12 @@ def test_config_missing_optional_params(hass, mock_session_send):
 
 @mock.patch("os.access", return_value=True)
 @mock.patch("os.path.isfile", mock.Mock(return_value=True))
-def test_config_default_nonssl_port(hass, mock_session_send):
+def test_config_default_nonssl_port(hass: HomeAssistant, mock_session_send) -> None:
     """Test the setup without a default port set without ssl enabled."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "password",
@@ -107,12 +110,12 @@ def test_config_default_nonssl_port(hass, mock_session_send):
 
 @mock.patch("os.access", return_value=True)
 @mock.patch("os.path.isfile", mock.Mock(return_value=True))
-def test_config_default_ssl_port(hass, mock_session_send):
+def test_config_default_ssl_port(hass: HomeAssistant, mock_session_send) -> None:
     """Test the setup without a default port set with ssl enabled."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_SSL: True,
                 CONF_USERNAME: "foo",
@@ -127,16 +130,18 @@ def test_config_default_ssl_port(hass, mock_session_send):
 
 @mock.patch("os.access", return_value=True)
 @mock.patch("os.path.isfile", mock.Mock(return_value=True))
-def test_config_verify_ssl_but_no_ssl_enabled(hass, mock_session_send):
+def test_config_verify_ssl_but_no_ssl_enabled(
+    hass: HomeAssistant, mock_session_send
+) -> None:
     """Test the setup with a string with ssl_verify but ssl not enabled."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: 1234,
                 CONF_SSL: False,
-                CONF_VERIFY_SSL: "/tmp/tomato.crt",
+                CONF_VERIFY_SSL: "/test/tomato.crt",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "password",
                 tomato.CONF_HTTP_ID: "1234567890",
@@ -153,24 +158,24 @@ def test_config_verify_ssl_but_no_ssl_enabled(hass, mock_session_send):
     assert "_http_id=1234567890" in result.req.body
     assert "exec=devlist" in result.req.body
     assert mock_session_send.call_count == 1
-    assert mock_session_send.mock_calls[0] == mock.call(result.req, timeout=3)
+    assert mock_session_send.mock_calls[0] == mock.call(result.req, timeout=60)
 
 
 @mock.patch("os.access", return_value=True)
 @mock.patch("os.path.isfile", mock.Mock(return_value=True))
-def test_config_valid_verify_ssl_path(hass, mock_session_send):
+def test_config_valid_verify_ssl_path(hass: HomeAssistant, mock_session_send) -> None:
     """Test the setup with a string for ssl_verify.
 
     Representing the absolute path to a CA certificate bundle.
     """
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: 1234,
                 CONF_SSL: True,
-                CONF_VERIFY_SSL: "/tmp/tomato.crt",
+                CONF_VERIFY_SSL: "/test/tomato.crt",
                 CONF_USERNAME: "bar",
                 CONF_PASSWORD: "foo",
                 tomato.CONF_HTTP_ID: "0987654321",
@@ -188,16 +193,16 @@ def test_config_valid_verify_ssl_path(hass, mock_session_send):
     assert "exec=devlist" in result.req.body
     assert mock_session_send.call_count == 1
     assert mock_session_send.mock_calls[0] == mock.call(
-        result.req, timeout=3, verify="/tmp/tomato.crt"
+        result.req, timeout=60, verify="/test/tomato.crt"
     )
 
 
-def test_config_valid_verify_ssl_bool(hass, mock_session_send):
+def test_config_valid_verify_ssl_bool(hass: HomeAssistant, mock_session_send) -> None:
     """Test the setup with a bool for ssl_verify."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: 1234,
                 CONF_SSL: True,
@@ -219,16 +224,16 @@ def test_config_valid_verify_ssl_bool(hass, mock_session_send):
     assert "exec=devlist" in result.req.body
     assert mock_session_send.call_count == 1
     assert mock_session_send.mock_calls[0] == mock.call(
-        result.req, timeout=3, verify=False
+        result.req, timeout=60, verify=False
     )
 
 
-def test_config_errors():
+def test_config_errors() -> None:
     """Test for configuration errors."""
     with pytest.raises(vol.Invalid):
         tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 # No Host,
                 CONF_PORT: 1234,
                 CONF_SSL: True,
@@ -241,7 +246,7 @@ def test_config_errors():
     with pytest.raises(vol.Invalid):
         tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: -123456789,  # Bad Port
                 CONF_SSL: True,
@@ -254,7 +259,7 @@ def test_config_errors():
     with pytest.raises(vol.Invalid):
         tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: 1234,
                 CONF_SSL: True,
@@ -267,7 +272,7 @@ def test_config_errors():
     with pytest.raises(vol.Invalid):
         tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: 1234,
                 CONF_SSL: True,
@@ -280,7 +285,7 @@ def test_config_errors():
     with pytest.raises(vol.Invalid):
         tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_PORT: 1234,
                 CONF_SSL: True,
@@ -293,12 +298,12 @@ def test_config_errors():
 
 
 @mock.patch("requests.Session.send", side_effect=mock_session_response)
-def test_config_bad_credentials(hass, mock_exception_logger):
+def test_config_bad_credentials(hass: HomeAssistant, mock_exception_logger) -> None:
     """Test the setup with bad credentials."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "i_am",
                 CONF_PASSWORD: "an_imposter",
@@ -311,17 +316,17 @@ def test_config_bad_credentials(hass, mock_exception_logger):
 
     assert mock_exception_logger.call_count == 1
     assert mock_exception_logger.mock_calls[0] == mock.call(
-        "Failed to authenticate, " "please check your username and password"
+        "Failed to authenticate, please check your username and password"
     )
 
 
 @mock.patch("requests.Session.send", side_effect=mock_session_response)
-def test_bad_response(hass, mock_exception_logger):
+def test_bad_response(hass: HomeAssistant, mock_exception_logger) -> None:
     """Test the setup with bad response from router."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "bar",
@@ -339,12 +344,12 @@ def test_bad_response(hass, mock_exception_logger):
 
 
 @mock.patch("requests.Session.send", side_effect=mock_session_response)
-def test_scan_devices(hass, mock_exception_logger):
+def test_scan_devices(hass: HomeAssistant, mock_exception_logger) -> None:
     """Test scanning for new devices."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "bar",
@@ -358,12 +363,12 @@ def test_scan_devices(hass, mock_exception_logger):
 
 
 @mock.patch("requests.Session.send", side_effect=mock_session_response)
-def test_bad_connection(hass, mock_exception_logger):
+def test_bad_connection(hass: HomeAssistant, mock_exception_logger) -> None:
     """Test the router with a connection error."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "bar",
@@ -377,21 +382,21 @@ def test_bad_connection(hass, mock_exception_logger):
             "POST",
             "http://tomato-router:80/update.cgi",
             exc=requests.exceptions.ConnectionError,
-        ),
+        )
         tomato.get_scanner(hass, config)
     assert mock_exception_logger.call_count == 1
     assert mock_exception_logger.mock_calls[0] == mock.call(
-        "Failed to connect to the router " "or invalid http_id supplied"
+        "Failed to connect to the router or invalid http_id supplied"
     )
 
 
 @mock.patch("requests.Session.send", side_effect=mock_session_response)
-def test_router_timeout(hass, mock_exception_logger):
+def test_router_timeout(hass: HomeAssistant, mock_exception_logger) -> None:
     """Test the router with a timeout error."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "bar",
@@ -405,7 +410,7 @@ def test_router_timeout(hass, mock_exception_logger):
             "POST",
             "http://tomato-router:80/update.cgi",
             exc=requests.exceptions.Timeout,
-        ),
+        )
         tomato.get_scanner(hass, config)
     assert mock_exception_logger.call_count == 1
     assert mock_exception_logger.mock_calls[0] == mock.call(
@@ -414,12 +419,12 @@ def test_router_timeout(hass, mock_exception_logger):
 
 
 @mock.patch("requests.Session.send", side_effect=mock_session_response)
-def test_get_device_name(hass, mock_exception_logger):
+def test_get_device_name(hass: HomeAssistant, mock_exception_logger) -> None:
     """Test getting device names."""
     config = {
-        DOMAIN: tomato.PLATFORM_SCHEMA(
+        DEVICE_TRACKER_DOMAIN: tomato.PLATFORM_SCHEMA(
             {
-                CONF_PLATFORM: tomato.DOMAIN,
+                CONF_PLATFORM: DEVICE_TRACKER_DOMAIN,
                 CONF_HOST: "tomato-router",
                 CONF_USERNAME: "foo",
                 CONF_PASSWORD: "bar",

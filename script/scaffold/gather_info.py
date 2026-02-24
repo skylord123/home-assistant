@@ -1,12 +1,13 @@
 """Gather info for scaffolding."""
+
 import json
 
 from homeassistant.util import slugify
+from script.hassfest.manifest import SUPPORTED_IOT_CLASSES
 
 from .const import COMPONENT_DIR
-from .model import Info
 from .error import ExitApp
-
+from .model import Info
 
 CHECK_EMPTY = ["Cannot be empty", lambda value: value]
 
@@ -23,7 +24,12 @@ def gather_info(arguments) -> Info:
         info = _gather_info(
             {
                 "domain": {
-                    "prompt": "What is the domain?",
+                    "prompt": (
+                        """What is the domain?
+
+Hint: The domain is a short name consisting of characters and underscores.
+This domain has to be unique, cannot be changed, and has to match the directory name of the integration."""
+                    ),
                     "validators": [
                         CHECK_EMPTY,
                         [
@@ -47,6 +53,7 @@ def gather_info(arguments) -> Info:
                 "codeowner": "@developer",
                 "requirement": "aiodevelop==1.2.3",
                 "oauth2": True,
+                "iot_class": "local_polling",
             }
         )
     else:
@@ -57,7 +64,7 @@ def gather_info(arguments) -> Info:
 
 YES_NO = {
     "validators": [["Type either 'yes' or 'no'", lambda value: value in ("yes", "no")]],
-    "convertor": lambda value: value == "yes",
+    "converter": lambda value: value == "yes",
 }
 
 
@@ -70,13 +77,8 @@ def gather_new_integration(determine_auth: bool) -> Info:
         },
         "codeowner": {
             "prompt": "What is your GitHub handle?",
-            "validators": [
-                CHECK_EMPTY,
-                [
-                    'GitHub handles need to start with an "@"',
-                    lambda value: value.startswith("@"),
-                ],
-            ],
+            "validators": [CHECK_EMPTY],
+            "converter": lambda value: value if value.startswith("@") else f"@{value}",
         },
         "requirement": {
             "prompt": "What PyPI package and version do you depend on? Leave blank for none.",
@@ -84,6 +86,22 @@ def gather_new_integration(determine_auth: bool) -> Info:
                 [
                     "Versions should be pinned using '=='.",
                     lambda value: not value or "==" in value,
+                ]
+            ],
+        },
+        "iot_class": {
+            "prompt": (
+                f"""How will your integration gather data?
+
+Valid values are {", ".join(SUPPORTED_IOT_CLASSES)}
+
+More info @ https://developers.home-assistant.io/docs/creating_integration_manifest#iot-class
+"""
+            ),
+            "validators": [
+                [
+                    f"You need to pick one of {', '.join(SUPPORTED_IOT_CLASSES)}",
+                    lambda value: value in SUPPORTED_IOT_CLASSES,
                 ]
             ],
         },
@@ -99,6 +117,11 @@ def gather_new_integration(determine_auth: bool) -> Info:
                 },
                 "discoverable": {
                     "prompt": "Is the device/service discoverable on the local network? (yes/no)",
+                    "default": "no",
+                    **YES_NO,
+                },
+                "helper": {
+                    "prompt": "Is this a helper integration? (yes/no)",
                     "default": "no",
                     **YES_NO,
                 },
@@ -140,8 +163,8 @@ def _gather_info(fields) -> dict:
                 if "default" in info:
                     msg += f" [{info['default']}]"
                 value = input(f"{msg}\n> ")
-            except (KeyboardInterrupt, EOFError):
-                raise ExitApp("Interrupted!", 1)
+            except (KeyboardInterrupt, EOFError) as err:
+                raise ExitApp("Interrupted!", 1) from err
 
             value = value.strip()
 
@@ -156,8 +179,8 @@ def _gather_info(fields) -> dict:
                     break
 
             if hint is None:
-                if "convertor" in info:
-                    value = info["convertor"](value)
+                if "converter" in info:
+                    value = info["converter"](value)
                 answers[key] = value
 
     return answers

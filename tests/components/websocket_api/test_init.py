@@ -1,27 +1,23 @@
 """Tests for the Home Assistant Websocket API."""
-import asyncio
-from unittest.mock import patch, Mock
+
+from unittest.mock import Mock, patch
 
 from aiohttp import WSMsgType
-import pytest
 import voluptuous as vol
 
-from homeassistant.components.websocket_api import const, messages
+from homeassistant.components.websocket_api import (
+    async_register_command,
+    const,
+    messages,
+)
+from homeassistant.core import HomeAssistant
 
 
-@pytest.fixture
-def mock_low_queue():
-    """Mock a low queue."""
-    with patch("homeassistant.components.websocket_api.http.MAX_PENDING_MSG", 5):
-        yield
-
-
-@asyncio.coroutine
-def test_invalid_message_format(websocket_client):
+async def test_invalid_message_format(websocket_client) -> None:
     """Test sending invalid JSON."""
-    yield from websocket_client.send_json({"type": 5})
+    await websocket_client.send_json({"type": 5})
 
-    msg = yield from websocket_client.receive_json()
+    msg = await websocket_client.receive_json()
 
     assert msg["type"] == const.TYPE_RESULT
     error = msg["error"]
@@ -29,49 +25,38 @@ def test_invalid_message_format(websocket_client):
     assert error["message"].startswith("Message incorrectly formatted")
 
 
-@asyncio.coroutine
-def test_invalid_json(websocket_client):
+async def test_invalid_json(websocket_client) -> None:
     """Test sending invalid JSON."""
-    yield from websocket_client.send_str("this is not JSON")
+    await websocket_client.send_str("this is not JSON")
 
-    msg = yield from websocket_client.receive()
+    msg = await websocket_client.receive()
 
     assert msg.type == WSMsgType.close
 
 
-@asyncio.coroutine
-def test_quiting_hass(hass, websocket_client):
+async def test_quiting_hass(hass: HomeAssistant, websocket_client) -> None:
     """Test sending invalid JSON."""
     with patch.object(hass.loop, "stop"):
-        yield from hass.async_stop()
+        await hass.async_stop()
 
-    msg = yield from websocket_client.receive()
+    msg = await websocket_client.receive()
 
-    assert msg.type == WSMsgType.CLOSE
+    assert msg.type is WSMsgType.CLOSE
 
 
-@asyncio.coroutine
-def test_pending_msg_overflow(hass, mock_low_queue, websocket_client):
+async def test_unknown_command(websocket_client) -> None:
     """Test get_panels command."""
-    for idx in range(10):
-        yield from websocket_client.send_json({"id": idx + 1, "type": "ping"})
-    msg = yield from websocket_client.receive()
-    assert msg.type == WSMsgType.close
+    await websocket_client.send_json({"id": 5, "type": "unknown_command"})
 
-
-@asyncio.coroutine
-def test_unknown_command(websocket_client):
-    """Test get_panels command."""
-    yield from websocket_client.send_json({"id": 5, "type": "unknown_command"})
-
-    msg = yield from websocket_client.receive_json()
+    msg = await websocket_client.receive_json()
     assert not msg["success"]
     assert msg["error"]["code"] == const.ERR_UNKNOWN_COMMAND
 
 
-async def test_handler_failing(hass, websocket_client):
+async def test_handler_failing(hass: HomeAssistant, websocket_client) -> None:
     """Test a command that raises."""
-    hass.components.websocket_api.async_register_command(
+    async_register_command(
+        hass,
         "bla",
         Mock(side_effect=TypeError),
         messages.BASE_COMMAND_MESSAGE_SCHEMA.extend({"type": "bla"}),
@@ -85,9 +70,10 @@ async def test_handler_failing(hass, websocket_client):
     assert msg["error"]["code"] == const.ERR_UNKNOWN_ERROR
 
 
-async def test_invalid_vol(hass, websocket_client):
+async def test_invalid_vol(hass: HomeAssistant, websocket_client) -> None:
     """Test a command that raises invalid vol error."""
-    hass.components.websocket_api.async_register_command(
+    async_register_command(
+        hass,
         "bla",
         Mock(side_effect=TypeError),
         messages.BASE_COMMAND_MESSAGE_SCHEMA.extend(

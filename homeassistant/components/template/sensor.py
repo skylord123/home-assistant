@@ -1,285 +1,315 @@
 """Allows the creation of a sensor that breaks out state_attributes."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import date, datetime
+from decimal import Decimal
 import logging
-from typing import Optional
+from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.core import callback
 from homeassistant.components.sensor import (
-    ENTITY_ID_FORMAT,
-    PLATFORM_SCHEMA,
+    ATTR_LAST_RESET,
+    CONF_STATE_CLASS,
     DEVICE_CLASSES_SCHEMA,
+    DOMAIN as SENSOR_DOMAIN,
+    ENTITY_ID_FORMAT,
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    STATE_CLASSES_SCHEMA,
+    RestoreSensor,
+    SensorDeviceClass,
+    SensorStateClass,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ATTR_FRIENDLY_NAME,
-    ATTR_UNIT_OF_MEASUREMENT,
-    CONF_VALUE_TEMPLATE,
-    CONF_ICON_TEMPLATE,
-    CONF_ENTITY_PICTURE_TEMPLATE,
     ATTR_ENTITY_ID,
-    CONF_SENSORS,
-    EVENT_HOMEASSISTANT_START,
-    CONF_FRIENDLY_NAME_TEMPLATE,
-    MATCH_ALL,
     CONF_DEVICE_CLASS,
+    CONF_ENTITY_PICTURE_TEMPLATE,
+    CONF_FRIENDLY_NAME,
+    CONF_FRIENDLY_NAME_TEMPLATE,
+    CONF_ICON_TEMPLATE,
+    CONF_NAME,
+    CONF_SENSORS,
+    CONF_STATE,
+    CONF_UNIQUE_ID,
+    CONF_UNIT_OF_MEASUREMENT,
+    CONF_VALUE_TEMPLATE,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType, StateType
+from homeassistant.util import dt as dt_util
 
-from homeassistant.exceptions import TemplateError
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity, async_generate_entity_id
-from homeassistant.helpers.event import async_track_state_change
-from . import extract_entities, initialise_templates
-from .const import CONF_AVAILABILITY_TEMPLATE
+from . import TriggerUpdateCoordinator, validators as template_validators
+from .entity import AbstractTemplateEntity
+from .helpers import (
+    async_setup_template_entry,
+    async_setup_template_platform,
+    async_setup_template_preview,
+)
+from .schemas import (
+    TEMPLATE_ENTITY_ATTRIBUTES_SCHEMA_LEGACY,
+    TEMPLATE_ENTITY_AVAILABILITY_SCHEMA_LEGACY,
+    TEMPLATE_ENTITY_COMMON_CONFIG_ENTRY_SCHEMA,
+    make_template_entity_common_modern_attributes_schema,
+)
+from .template_entity import TemplateEntity
+from .trigger_entity import TriggerEntity
 
-CONF_ATTRIBUTE_TEMPLATES = "attribute_templates"
+DEFAULT_NAME = "Template Sensor"
 
-_LOGGER = logging.getLogger(__name__)
+LEGACY_FIELDS = {
+    CONF_FRIENDLY_NAME_TEMPLATE: CONF_NAME,
+    CONF_VALUE_TEMPLATE: CONF_STATE,
+}
 
-SENSOR_SCHEMA = vol.Schema(
+
+def validate_last_reset(val):
+    """Run extra validation checks."""
+    if (
+        val.get(ATTR_LAST_RESET) is not None
+        and val.get(CONF_STATE_CLASS) != SensorStateClass.TOTAL
+    ):
+        raise vol.Invalid(
+            "last_reset is only valid for template sensors with state_class 'total'"
+        )
+
+    return val
+
+
+SENSOR_COMMON_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_VALUE_TEMPLATE): cv.template,
-        vol.Optional(CONF_ICON_TEMPLATE): cv.template,
-        vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
-        vol.Optional(CONF_FRIENDLY_NAME_TEMPLATE): cv.template,
-        vol.Optional(CONF_AVAILABILITY_TEMPLATE): cv.template,
-        vol.Optional(CONF_ATTRIBUTE_TEMPLATES, default={}): vol.Schema(
-            {cv.string: cv.template}
-        ),
-        vol.Optional(ATTR_FRIENDLY_NAME): cv.string,
-        vol.Optional(ATTR_UNIT_OF_MEASUREMENT): cv.string,
+        vol.Required(CONF_STATE): cv.template,
         vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
+        vol.Optional(CONF_STATE_CLASS): STATE_CLASSES_SCHEMA,
+        vol.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_SENSORS): cv.schema_with_slug_keys(SENSOR_SCHEMA)}
+SENSOR_YAML_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Optional(ATTR_LAST_RESET): cv.template,
+        }
+    )
+    .extend(SENSOR_COMMON_SCHEMA.schema)
+    .extend(
+        make_template_entity_common_modern_attributes_schema(
+            SENSOR_DOMAIN, DEFAULT_NAME
+        ).schema
+    ),
+    validate_last_reset,
 )
 
+SENSOR_CONFIG_ENTRY_SCHEMA = SENSOR_COMMON_SCHEMA.extend(
+    TEMPLATE_ENTITY_COMMON_CONFIG_ENTRY_SCHEMA.schema
+)
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the template sensors."""
-    sensors = []
-
-    for device, device_config in config[CONF_SENSORS].items():
-        state_template = device_config[CONF_VALUE_TEMPLATE]
-        icon_template = device_config.get(CONF_ICON_TEMPLATE)
-        entity_picture_template = device_config.get(CONF_ENTITY_PICTURE_TEMPLATE)
-        availability_template = device_config.get(CONF_AVAILABILITY_TEMPLATE)
-        friendly_name = device_config.get(ATTR_FRIENDLY_NAME, device)
-        friendly_name_template = device_config.get(CONF_FRIENDLY_NAME_TEMPLATE)
-        unit_of_measurement = device_config.get(ATTR_UNIT_OF_MEASUREMENT)
-        device_class = device_config.get(CONF_DEVICE_CLASS)
-        attribute_templates = device_config[CONF_ATTRIBUTE_TEMPLATES]
-
-        templates = {
-            CONF_VALUE_TEMPLATE: state_template,
-            CONF_ICON_TEMPLATE: icon_template,
-            CONF_ENTITY_PICTURE_TEMPLATE: entity_picture_template,
-            CONF_FRIENDLY_NAME_TEMPLATE: friendly_name_template,
-            CONF_AVAILABILITY_TEMPLATE: availability_template,
+SENSOR_LEGACY_YAML_SCHEMA = vol.All(
+    cv.deprecated(ATTR_ENTITY_ID),
+    vol.Schema(
+        {
+            vol.Required(CONF_VALUE_TEMPLATE): cv.template,
+            vol.Optional(CONF_ICON_TEMPLATE): cv.template,
+            vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
+            vol.Optional(CONF_FRIENDLY_NAME_TEMPLATE): cv.template,
+            vol.Optional(CONF_FRIENDLY_NAME): cv.string,
+            vol.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
+            vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
+            vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
+            vol.Optional(CONF_UNIQUE_ID): cv.string,
         }
+    )
+    .extend(TEMPLATE_ENTITY_ATTRIBUTES_SCHEMA_LEGACY.schema)
+    .extend(TEMPLATE_ENTITY_AVAILABILITY_SCHEMA_LEGACY.schema),
+)
 
-        initialise_templates(hass, templates, attribute_templates)
-        entity_ids = extract_entities(
-            device,
-            "sensor",
-            device_config.get(ATTR_ENTITY_ID),
-            templates,
-            attribute_templates,
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
+    {vol.Required(CONF_SENSORS): cv.schema_with_slug_keys(SENSOR_LEGACY_YAML_SCHEMA)}
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    """Set up the template sensors."""
+    await async_setup_template_platform(
+        hass,
+        SENSOR_DOMAIN,
+        config,
+        StateSensorEntity,
+        TriggerSensorEntity,
+        async_add_entities,
+        discovery_info,
+        LEGACY_FIELDS,
+        legacy_key=CONF_SENSORS,
+    )
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Initialize config entry."""
+    await async_setup_template_entry(
+        hass,
+        config_entry,
+        async_add_entities,
+        StateSensorEntity,
+        SENSOR_CONFIG_ENTRY_SCHEMA,
+    )
+
+
+@callback
+def async_create_preview_sensor(
+    hass: HomeAssistant, name: str, config: dict[str, Any]
+) -> StateSensorEntity:
+    """Create a preview sensor."""
+    return async_setup_template_preview(
+        hass, name, config, StateSensorEntity, SENSOR_CONFIG_ENTRY_SCHEMA
+    )
+
+
+def validate_datetime(
+    entity: AbstractTemplateSensor,
+    attribute: str,
+    resolve_as: SensorDeviceClass,
+    **kwargs,
+) -> Callable[[Any], datetime | date | None]:
+    """Converts the template result into a datetime or date."""
+
+    def convert(result: Any) -> datetime | date | None:
+        if resolve_as == SensorDeviceClass.TIMESTAMP:
+            if isinstance(result, datetime):
+                return result
+
+            if (parsed_timestamp := dt_util.parse_datetime(result)) is None:
+                template_validators.log_validation_result_error(
+                    entity, attribute, result, "expected a valid timestamp"
+                )
+                return None
+
+            if kwargs.get("require_tzinfo", True) and parsed_timestamp.tzinfo is None:
+                template_validators.log_validation_result_error(
+                    entity,
+                    attribute,
+                    result,
+                    "expected a valid timestamp with a timezone",
+                )
+                return None
+
+            return parsed_timestamp
+
+        if (parsed_date := dt_util.parse_date(result)) is not None:
+            return parsed_date
+
+        template_validators.log_validation_result_error(
+            entity, attribute, result, "expected a valid date"
+        )
+        return None
+
+    return convert
+
+
+class AbstractTemplateSensor(AbstractTemplateEntity, RestoreSensor):
+    """Representation of a template sensor features."""
+
+    _entity_id_format = ENTITY_ID_FORMAT
+
+    # The super init is not called because TemplateEntity and TriggerEntity will call AbstractTemplateEntity.__init__.
+    # This ensures that the __init__ on AbstractTemplateEntity is not called twice.
+    def __init__(self, config: ConfigType) -> None:  # pylint: disable=super-init-not-called
+        """Initialize the features."""
+        self._attr_native_unit_of_measurement = config.get(CONF_UNIT_OF_MEASUREMENT)
+        self._attr_device_class = config.get(CONF_DEVICE_CLASS)
+        self._attr_state_class = config.get(CONF_STATE_CLASS)
+        self._attr_last_reset = None
+
+        self.setup_state_template(
+            CONF_STATE,
+            "_attr_native_value",
+            self._validate_state,
+        )
+        self.setup_template(
+            ATTR_LAST_RESET,
+            "_attr_last_reset",
+            validate_datetime(
+                self, ATTR_LAST_RESET, SensorDeviceClass.TIMESTAMP, require_tzinfo=False
+            ),
         )
 
-        sensors.append(
-            SensorTemplate(
-                hass,
-                device,
-                friendly_name,
-                friendly_name_template,
-                unit_of_measurement,
-                state_template,
-                icon_template,
-                entity_picture_template,
-                availability_template,
-                entity_ids,
-                device_class,
-                attribute_templates,
-            )
-        )
+    def _validate_state(
+        self, result: Any
+    ) -> StateType | date | datetime | Decimal | None:
+        """Validate the state."""
+        if self._numeric_state_expected:
+            return template_validators.number(self, CONF_STATE)(result)
 
-    async_add_entities(sensors)
+        if result is None or self.device_class not in (
+            SensorDeviceClass.DATE,
+            SensorDeviceClass.TIMESTAMP,
+        ):
+            return result
 
-    return True
+        return validate_datetime(self, CONF_STATE, self.device_class)(result)
 
 
-class SensorTemplate(Entity):
+class StateSensorEntity(TemplateEntity, AbstractTemplateSensor):
     """Representation of a Template Sensor."""
+
+    _attr_should_poll = False
+    _entity_id_format = ENTITY_ID_FORMAT
 
     def __init__(
         self,
-        hass,
-        device_id,
-        friendly_name,
-        friendly_name_template,
-        unit_of_measurement,
-        state_template,
-        icon_template,
-        entity_picture_template,
-        availability_template,
-        entity_ids,
-        device_class,
-        attribute_templates,
-    ):
+        hass: HomeAssistant,
+        config: dict[str, Any],
+        unique_id: str | None,
+    ) -> None:
         """Initialize the sensor."""
-        self.hass = hass
-        self.entity_id = async_generate_entity_id(
-            ENTITY_ID_FORMAT, device_id, hass=hass
-        )
-        self._name = friendly_name
-        self._friendly_name_template = friendly_name_template
-        self._unit_of_measurement = unit_of_measurement
-        self._template = state_template
-        self._state = None
-        self._icon_template = icon_template
-        self._entity_picture_template = entity_picture_template
-        self._availability_template = availability_template
-        self._icon = None
-        self._entity_picture = None
-        self._entities = entity_ids
-        self._device_class = device_class
-        self._available = True
-        self._attribute_templates = attribute_templates
-        self._attributes = {}
+        TemplateEntity.__init__(self, hass, config, unique_id)
+        AbstractTemplateSensor.__init__(self, config)
 
-    async def async_added_to_hass(self):
-        """Register callbacks."""
 
-        @callback
-        def template_sensor_state_listener(entity, old_state, new_state):
-            """Handle device state changes."""
-            self.async_schedule_update_ha_state(True)
+class TriggerSensorEntity(TriggerEntity, AbstractTemplateSensor):
+    """Sensor entity based on trigger data."""
 
-        @callback
-        def template_sensor_startup(event):
-            """Update template on startup."""
-            if self._entities != MATCH_ALL:
-                # Track state change only for valid templates
-                async_track_state_change(
-                    self.hass, self._entities, template_sensor_state_listener
-                )
+    domain = SENSOR_DOMAIN
 
-            self.async_schedule_update_ha_state(True)
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TriggerUpdateCoordinator,
+        config: ConfigType,
+    ) -> None:
+        """Initialize."""
+        TriggerEntity.__init__(self, hass, coordinator, config)
+        AbstractTemplateSensor.__init__(self, config)
 
-        self.hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_START, template_sensor_startup
-        )
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def state(self):
-        """Return the state of the sensor."""
-        return self._state
-
-    @property
-    def icon(self):
-        """Return the icon to use in the frontend, if any."""
-        return self._icon
-
-    @property
-    def device_class(self) -> Optional[str]:
-        """Return the device class of the sensor."""
-        return self._device_class
-
-    @property
-    def entity_picture(self):
-        """Return the entity_picture to use in the frontend, if any."""
-        return self._entity_picture
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit_of_measurement of the device."""
-        return self._unit_of_measurement
-
-    @property
-    def available(self) -> bool:
-        """Return if the device is available."""
-        return self._available
-
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes."""
-        return self._attributes
-
-    @property
-    def should_poll(self):
-        """No polling needed."""
-        return False
-
-    async def async_update(self):
-        """Update the state from the template."""
-        try:
-            self._state = self._template.async_render()
-            self._available = True
-        except TemplateError as ex:
-            self._available = False
-            if ex.args and ex.args[0].startswith(
-                "UndefinedError: 'None' has no attribute"
-            ):
-                # Common during HA startup - so just a warning
-                _LOGGER.warning(
-                    "Could not render template %s," " the state is unknown.", self._name
-                )
-            else:
-                self._state = None
-                _LOGGER.error("Could not render template %s: %s", self._name, ex)
-
-        attrs = {}
-        for key, value in self._attribute_templates.items():
-            try:
-                attrs[key] = value.async_render()
-            except TemplateError as err:
-                _LOGGER.error("Error rendering attribute %s: %s", key, err)
-
-        self._attributes = attrs
-
-        templates = {
-            "_icon": self._icon_template,
-            "_entity_picture": self._entity_picture_template,
-            "_name": self._friendly_name_template,
-            "_available": self._availability_template,
-        }
-
-        for property_name, template in templates.items():
-            if template is None:
-                continue
-
-            try:
-                value = template.async_render()
-                if property_name == "_available":
-                    value = value.lower() == "true"
-                setattr(self, property_name, value)
-            except TemplateError as ex:
-                friendly_property_name = property_name[1:].replace("_", " ")
-                if ex.args and ex.args[0].startswith(
-                    "UndefinedError: 'None' has no attribute"
-                ):
-                    # Common during HA startup - so just a warning
-                    _LOGGER.warning(
-                        "Could not render %s template %s," " the state is unknown.",
-                        friendly_property_name,
-                        self._name,
-                    )
-                    continue
-
-                try:
-                    setattr(self, property_name, getattr(super(), property_name))
-                except AttributeError:
-                    _LOGGER.error(
-                        "Could not render %s template %s: %s",
-                        friendly_property_name,
-                        self._name,
-                        ex,
-                    )
+    async def async_added_to_hass(self) -> None:
+        """Restore last state."""
+        await super().async_added_to_hass()
+        if (
+            (last_state := await self.async_get_last_state()) is not None
+            and (extra_data := await self.async_get_last_sensor_data()) is not None
+            and last_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+            # The trigger might have fired already while we waited for stored data,
+            # then we should not restore state
+            and CONF_STATE not in self._rendered
+        ):
+            self._attr_native_value = extra_data.native_value
+            self.restore_attributes(last_state)

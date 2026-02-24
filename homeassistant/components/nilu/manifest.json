@@ -1,12 +1,10 @@
 {
   "domain": "nilu",
-  "name": "Nilu",
+  "name": "Norwegian Institute for Air Research (NILU)",
+  "codeowners": ["@hfurubotten"],
   "documentation": "https://www.home-assistant.io/integrations/nilu",
-  "requirements": [
-    "niluclient==0.1.2"
-  ],
-  "dependencies": [],
-  "codeowners": [
-    "@hfurubotten"
-  ]
+  "iot_class": "cloud_polling",
+  "loggers": ["niluclient"],
+  "quality_scale": "legacy",
+  "requirements": ["niluclient==0.1.2"]
 }

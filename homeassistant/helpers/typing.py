@@ -1,18 +1,29 @@
 """Typing Helpers for Home Assistant."""
-from typing import Dict, Any, Tuple, Optional
 
-import homeassistant.core
+from collections.abc import Mapping
+from enum import Enum
+from typing import Any, Never
 
-# pylint: disable=invalid-name
+import voluptuous as vol
 
-GPSType = Tuple[float, float]
-ConfigType = Dict[str, Any]
-ContextType = homeassistant.core.Context
-EventType = homeassistant.core.Event
-HomeAssistantType = homeassistant.core.HomeAssistant
-ServiceCallType = homeassistant.core.ServiceCall
-ServiceDataType = Dict[str, Any]
-TemplateVarsType = Optional[Dict[str, Any]]
+type GPSType = tuple[float, float]
+type ConfigType = dict[str, Any]
+type DiscoveryInfoType = dict[str, Any]
+type ServiceDataType = dict[str, Any]
+type StateType = str | int | float | None
+type TemplateVarsType = Mapping[str, Any] | None
+type NoEventData = Mapping[str, Never]
+type VolSchemaType = vol.Schema | vol.All | vol.Any
+type VolDictType = dict[str | vol.Marker, Any]
 
 # Custom type for recorder Queries
-QueryType = Any
+type QueryType = Any
+
+
+class UndefinedType(Enum):
+    """Singleton type for use with not set sentinel values."""
+
+    _singleton = 0
+
+
+UNDEFINED = UndefinedType._singleton  # noqa: SLF001

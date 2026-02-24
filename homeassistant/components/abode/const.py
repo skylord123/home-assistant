@@ -1,8 +1,19 @@
 """Constants for the Abode Security System component."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from . import AbodeSystem
+
+LOGGER = logging.getLogger(__package__)
+
 DOMAIN = "abode"
+DOMAIN_DATA: HassKey[AbodeSystem] = HassKey(DOMAIN)
 ATTRIBUTION = "Data provided by goabode.com"
 
-DEFAULT_CACHEDB = "abodepy_cache.pickle"
-
-SIGNAL_CAPTURE_IMAGE = "abode_camera_capture_{}"
-SIGNAL_TRIGGER_QUICK_ACTION = "abode_trigger_quick_action_{}"
+CONF_POLLING = "polling"

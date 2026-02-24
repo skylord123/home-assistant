@@ -1,66 +1,83 @@
 """Support for Jewish Calendar binary sensors."""
-import logging
 
-import hdate
+from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorDevice
-import homeassistant.util.dt as dt_util
+from collections.abc import Callable
+from dataclasses import dataclass
+import datetime as dt
 
-from . import DOMAIN, SENSOR_TYPES
+from hdate.zmanim import Zmanim
 
-_LOGGER = logging.getLogger(__name__)
+from homeassistant.components.binary_sensor import (
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
+
+from .entity import JewishCalendarConfigEntry, JewishCalendarEntity
+
+PARALLEL_UPDATES = 0
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the Jewish Calendar binary sensor devices."""
-    if discovery_info is None:
-        return
+@dataclass(frozen=True, kw_only=True)
+class JewishCalendarBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Binary Sensor Entity description for Jewish Calendar."""
 
+    is_on: Callable[[Zmanim], Callable[[dt.datetime], bool]]
+
+
+BINARY_SENSORS: tuple[JewishCalendarBinarySensorEntityDescription, ...] = (
+    JewishCalendarBinarySensorEntityDescription(
+        key="issur_melacha_in_effect",
+        translation_key="issur_melacha_in_effect",
+        is_on=lambda state: state.issur_melacha_in_effect,
+    ),
+    JewishCalendarBinarySensorEntityDescription(
+        key="erev_shabbat_hag",
+        translation_key="erev_shabbat_hag",
+        is_on=lambda state: state.erev_shabbat_chag,
+        entity_registry_enabled_default=False,
+    ),
+    JewishCalendarBinarySensorEntityDescription(
+        key="motzei_shabbat_hag",
+        translation_key="motzei_shabbat_hag",
+        is_on=lambda state: state.motzei_shabbat_chag,
+        entity_registry_enabled_default=False,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: JewishCalendarConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Jewish Calendar binary sensors."""
     async_add_entities(
-        [
-            JewishCalendarBinarySensor(hass.data[DOMAIN], sensor, sensor_info)
-            for sensor, sensor_info in SENSOR_TYPES["binary"].items()
-        ]
+        JewishCalendarBinarySensor(config_entry, description)
+        for description in BINARY_SENSORS
     )
 
 
-class JewishCalendarBinarySensor(BinarySensorDevice):
+class JewishCalendarBinarySensor(JewishCalendarEntity, BinarySensorEntity):
     """Representation of an Jewish Calendar binary sensor."""
 
-    def __init__(self, data, sensor, sensor_info):
-        """Initialize the binary sensor."""
-        self._location = data["location"]
-        self._type = sensor
-        self._name = f"{data['name']} {sensor_info[0]}"
-        self._icon = sensor_info[1]
-        self._hebrew = data["language"] == "hebrew"
-        self._candle_lighting_offset = data["candle_lighting_offset"]
-        self._havdalah_offset = data["havdalah_offset"]
-        self._state = False
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    entity_description: JewishCalendarBinarySensorEntityDescription
 
     @property
-    def icon(self):
-        """Return the icon of the entity."""
-        return self._icon
-
-    @property
-    def name(self):
-        """Return the name of the entity."""
-        return self._name
-
-    @property
-    def is_on(self):
+    def is_on(self) -> bool:
         """Return true if sensor is on."""
-        return self._state
+        return self.entity_description.is_on(self.coordinator.zmanim)(dt_util.now())
 
-    async def async_update(self):
-        """Update the state of the sensor."""
-        zmanim = hdate.Zmanim(
-            date=dt_util.now(),
-            location=self._location,
-            candle_lighting_offset=self._candle_lighting_offset,
-            havdalah_offset=self._havdalah_offset,
-            hebrew=self._hebrew,
-        )
-
-        self._state = zmanim.issur_melacha_in_effect
+    def _update_times(self, zmanim: Zmanim) -> list[dt.datetime | None]:
+        """Return a list of times to update the sensor."""
+        return [
+            zmanim.netz_hachama.local + dt.timedelta(days=1),
+            zmanim.candle_lighting,
+            zmanim.havdalah,
+        ]

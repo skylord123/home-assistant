@@ -1,18 +1,29 @@
 """Support for departure information for Rhein-Main public transport."""
+
+from __future__ import annotations
+
 import asyncio
-import logging
 from datetime import timedelta
+import logging
+from typing import Any
 
 from RMVtransport import RMVtransport
-from RMVtransport.rmvtransport import RMVtransportApiConnectionError
+from RMVtransport.rmvtransport import (
+    RMVtransportApiConnectionError,
+    RMVtransportDataError,
+)
 import voluptuous as vol
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_NAME, ATTR_ATTRIBUTION
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
+from homeassistant.const import CONF_NAME, CONF_TIMEOUT, UnitOfTime
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,7 +37,6 @@ CONF_LINES = "lines"
 CONF_PRODUCTS = "products"
 CONF_TIME_OFFSET = "time_offset"
 CONF_MAX_JOURNEYS = "max_journeys"
-CONF_TIMEOUT = "timeout"
 
 DEFAULT_NAME = "RMV Journey"
 
@@ -49,7 +59,7 @@ ATTRIBUTION = "Data provided by opendata.rmv.de"
 
 SCAN_INTERVAL = timedelta(seconds=60)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_NEXT_DEPARTURE): [
             {
@@ -74,44 +84,48 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the RMV departure sensor."""
     timeout = config.get(CONF_TIMEOUT)
 
-    session = async_get_clientsession(hass)
-
-    sensors = []
-    for next_departure in config.get(CONF_NEXT_DEPARTURE):
-        sensors.append(
-            RMVDepartureSensor(
-                session,
-                next_departure[CONF_STATION],
-                next_departure.get(CONF_DESTINATIONS),
-                next_departure.get(CONF_DIRECTION),
-                next_departure.get(CONF_LINES),
-                next_departure.get(CONF_PRODUCTS),
-                next_departure.get(CONF_TIME_OFFSET),
-                next_departure.get(CONF_MAX_JOURNEYS),
-                next_departure.get(CONF_NAME),
-                timeout,
-            )
+    sensors = [
+        RMVDepartureSensor(
+            next_departure[CONF_STATION],
+            next_departure.get(CONF_DESTINATIONS),
+            next_departure.get(CONF_DIRECTION),
+            next_departure.get(CONF_LINES),
+            next_departure.get(CONF_PRODUCTS),
+            next_departure.get(CONF_TIME_OFFSET),
+            next_departure.get(CONF_MAX_JOURNEYS),
+            next_departure.get(CONF_NAME),
+            timeout,
         )
+        for next_departure in config[CONF_NEXT_DEPARTURE]
+    ]
 
-    tasks = [sensor.async_update() for sensor in sensors]
+    tasks = [asyncio.create_task(sensor.async_update()) for sensor in sensors]
     if tasks:
         await asyncio.wait(tasks)
-    if not all(sensor.data.departures for sensor in sensors):
+
+    if not any(sensor.data for sensor in sensors):
         raise PlatformNotReady
 
     async_add_entities(sensors)
 
 
-class RMVDepartureSensor(Entity):
+class RMVDepartureSensor(SensorEntity):
     """Implementation of an RMV departure sensor."""
+
+    _attr_attribution = ATTRIBUTION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
 
     def __init__(
         self,
-        session,
         station,
         destinations,
         direction,
@@ -124,10 +138,9 @@ class RMVDepartureSensor(Entity):
     ):
         """Initialize the sensor."""
         self._station = station
-        self._name = name
+        self._attr_name = name
         self._state = None
         self.data = RMVDepartureData(
-            session,
             station,
             destinations,
             direction,
@@ -137,25 +150,20 @@ class RMVDepartureSensor(Entity):
             max_journeys,
             timeout,
         )
-        self._icon = ICONS[None]
+        self._attr_icon = ICONS[None]
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def available(self):
+    def available(self) -> bool:
         """Return True if entity is available."""
         return self._state is not None
 
     @property
-    def state(self):
+    def native_value(self):
         """Return the next departure time."""
         return self._state
 
     @property
-    def state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
         try:
             return {
@@ -169,29 +177,22 @@ class RMVDepartureSensor(Entity):
         except IndexError:
             return {}
 
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return self._icon
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit this state is expressed in."""
-        return "min"
-
-    async def async_update(self):
+    async def async_update(self) -> None:
         """Get the latest data and update the state."""
         await self.data.async_update()
 
+        if self._attr_name == DEFAULT_NAME:
+            self._attr_name = self.data.station
+
+        self._station = self.data.station
+
         if not self.data.departures:
             self._state = None
-            self._icon = ICONS[None]
+            self._attr_icon = ICONS[None]
             return
-        if self._name == DEFAULT_NAME:
-            self._name = self.data.station
-        self._station = self.data.station
+
         self._state = self.data.departures[0].get("minutes")
-        self._icon = ICONS[self.data.departures[0].get("product")]
+        self._attr_icon = ICONS[self.data.departures[0].get("product")]
 
 
 class RMVDepartureData:
@@ -199,7 +200,6 @@ class RMVDepartureData:
 
     def __init__(
         self,
-        session,
         station_id,
         destinations,
         direction,
@@ -218,8 +218,9 @@ class RMVDepartureData:
         self._products = products
         self._time_offset = time_offset
         self._max_journeys = max_journeys
-        self.rmv = RMVtransport(session, timeout)
+        self.rmv = RMVtransport(timeout)
         self.departures = []
+        self._error_notification = False
 
     @Throttle(SCAN_INTERVAL)
     async def async_update(self):
@@ -231,31 +232,47 @@ class RMVDepartureData:
                 direction_id=self._direction,
                 max_journeys=50,
             )
-        except RMVtransportApiConnectionError:
+
+        except RMVtransportApiConnectionError, RMVtransportDataError:
             self.departures = []
-            _LOGGER.warning("Could not retrive data from rmv.de")
+            _LOGGER.warning("Could not retrieve data from rmv.de")
             return
+
         self.station = _data.get("station")
+
         _deps = []
+        _deps_not_found = set(self._destinations)
+
         for journey in _data["journeys"]:
             # find the first departure meeting the criteria
-            _nextdep = {ATTR_ATTRIBUTION: ATTRIBUTION}
+            _nextdep = {}
             if self._destinations:
                 dest_found = False
                 for dest in self._destinations:
                     if dest in journey["stops"]:
                         dest_found = True
+                        _deps_not_found.discard(dest)
                         _nextdep["destination"] = dest
+
                 if not dest_found:
                     continue
-            elif self._lines and journey["number"] not in self._lines:
+
+            if (self._lines and journey["number"] not in self._lines) or journey[
+                "minutes"
+            ] < self._time_offset:
                 continue
-            elif journey["minutes"] < self._time_offset:
-                continue
-            for attr in ["direction", "departure_time", "product", "minutes"]:
+
+            for attr in ("direction", "departure_time", "product", "minutes"):
                 _nextdep[attr] = journey.get(attr, "")
+
             _nextdep["line"] = journey.get("number", "")
             _deps.append(_nextdep)
+
             if len(_deps) > self._max_journeys:
                 break
+
+        if not self._error_notification and _deps_not_found:
+            self._error_notification = True
+            _LOGGER.warning("Destination(s) %s not found", ", ".join(_deps_not_found))
+
         self.departures = _deps

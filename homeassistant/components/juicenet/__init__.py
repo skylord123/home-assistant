@@ -1,68 +1,36 @@
-"""Support for Juicenet cloud."""
-import logging
+"""The JuiceNet integration."""
 
-import pyjuicenet
-import voluptuous as vol
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
-from homeassistant.const import CONF_ACCESS_TOKEN
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
-
-_LOGGER = logging.getLogger(__name__)
-
-DOMAIN = "juicenet"
-
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.Schema({vol.Required(CONF_ACCESS_TOKEN): cv.string})},
-    extra=vol.ALLOW_EXTRA,
-)
-
-JUICENET_COMPONENTS = ["sensor", "switch"]
+from .const import DOMAIN
 
 
-def setup(hass, config):
-    """Set up the Juicenet component."""
-    hass.data[DOMAIN] = {}
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up JuiceNet from a config entry."""
 
-    access_token = config[DOMAIN].get(CONF_ACCESS_TOKEN)
-    hass.data[DOMAIN]["api"] = pyjuicenet.Api(access_token)
-
-    for component in JUICENET_COMPONENTS:
-        discovery.load_platform(hass, component, DOMAIN, {}, config)
-
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        DOMAIN,
+        is_fixable=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="integration_removed",
+        translation_placeholders={
+            "entries": "/config/integrations/integration/juicenet",
+        },
+    )
     return True
 
 
-class JuicenetDevice(Entity):
-    """Represent a base Juicenet device."""
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    if all(
+        config_entry.state is ConfigEntryState.NOT_LOADED
+        for config_entry in hass.config_entries.async_entries(DOMAIN)
+        if config_entry.entry_id != entry.entry_id
+    ):
+        ir.async_delete_issue(hass, DOMAIN, DOMAIN)
 
-    def __init__(self, device, sensor_type, hass):
-        """Initialise the sensor."""
-        self.hass = hass
-        self.device = device
-        self.type = sensor_type
-
-    @property
-    def name(self):
-        """Return the name of the device."""
-        return self.device.name()
-
-    def update(self):
-        """Update state of the device."""
-        self.device.update_state()
-
-    @property
-    def _manufacturer_device_id(self):
-        """Return the manufacturer device id."""
-        return self.device.id()
-
-    @property
-    def _token(self):
-        """Return the device API token."""
-        return self.device.token()
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return "{}-{}".format(self.device.id(), self.type)
+    return True

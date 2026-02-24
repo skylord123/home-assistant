@@ -1,69 +1,80 @@
-"""Support for LG WebOS TV notification service."""
-import logging
+"""Support for LG webOS TV notification service."""
 
-from pylgtv import PyLGTVPairException, WebOsClient
-import voluptuous as vol
+from __future__ import annotations
 
-from homeassistant.components.notify import (
-    ATTR_DATA,
-    PLATFORM_SCHEMA,
-    BaseNotificationService,
-)
-from homeassistant.const import CONF_FILENAME, CONF_HOST, CONF_ICON
-import homeassistant.helpers.config_validation as cv
+from typing import Any
 
-_LOGGER = logging.getLogger(__name__)
+from aiowebostv import WebOsClient
 
-WEBOSTV_CONFIG_FILE = "webostv.conf"
+from homeassistant.components.notify import ATTR_DATA, BaseNotificationService
+from homeassistant.const import ATTR_CONFIG_ENTRY_ID, ATTR_ICON
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_FILENAME, default=WEBOSTV_CONFIG_FILE): cv.string,
-        vol.Optional(CONF_ICON): cv.string,
-    }
-)
+from . import WebOsTvConfigEntry
+from .const import DOMAIN, WEBOSTV_EXCEPTIONS
+
+PARALLEL_UPDATES = 0
 
 
-def get_service(hass, config, discovery_info=None):
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> BaseNotificationService | None:
     """Return the notify service."""
 
-    path = hass.config.path(config.get(CONF_FILENAME))
-    client = WebOsClient(config.get(CONF_HOST), key_file_path=path, timeout_connect=8)
+    if discovery_info is None:
+        return None
 
-    if not client.is_registered():
-        try:
-            client.register()
-        except PyLGTVPairException:
-            _LOGGER.error("Pairing with TV failed")
-            return None
-        except OSError:
-            _LOGGER.error("TV unreachable")
-            return None
+    config_entry = hass.config_entries.async_get_entry(
+        discovery_info[ATTR_CONFIG_ENTRY_ID]
+    )
+    assert config_entry is not None
 
-    return LgWebOSNotificationService(client, config.get(CONF_ICON))
+    return LgWebOSNotificationService(config_entry)
 
 
 class LgWebOSNotificationService(BaseNotificationService):
-    """Implement the notification service for LG WebOS TV."""
+    """Implement the notification service for LG webOS TV."""
 
-    def __init__(self, client, icon_path):
+    def __init__(self, entry: WebOsTvConfigEntry) -> None:
         """Initialize the service."""
-        self._client = client
-        self._icon_path = icon_path
+        self._entry = entry
 
-    def send_message(self, message="", **kwargs):
+    async def async_send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to the tv."""
+        client: WebOsClient = self._entry.runtime_data
+        data = kwargs[ATTR_DATA]
+        icon_path = data.get(ATTR_ICON) if data else None
 
-        try:
-            data = kwargs.get(ATTR_DATA)
-            icon_path = (
-                data.get(CONF_ICON, self._icon_path) if data else self._icon_path
+        if not client.tv_state.is_on:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="notify_device_off",
+                translation_placeholders={
+                    "name": str(self._entry.title),
+                    "func": __name__,
+                },
             )
-            self._client.send_message(message, icon_path=icon_path)
-        except PyLGTVPairException:
-            _LOGGER.error("Pairing with TV failed")
-        except FileNotFoundError:
-            _LOGGER.error("Icon %s not found", icon_path)
-        except OSError:
-            _LOGGER.error("TV unreachable")
+        try:
+            await client.send_message(message, icon_path=icon_path)
+        except FileNotFoundError as error:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="notify_icon_not_found",
+                translation_placeholders={
+                    "name": str(self._entry.title),
+                    "icon_path": str(icon_path),
+                },
+            ) from error
+        except WEBOSTV_EXCEPTIONS as error:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="notify_communication_error",
+                translation_placeholders={
+                    "name": str(self._entry.title),
+                    "error": str(error),
+                },
+            ) from error

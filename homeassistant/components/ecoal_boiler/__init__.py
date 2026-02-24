@@ -1,4 +1,5 @@
 """Support to control ecoal/esterownik.pl coal/wood boiler controller."""
+
 import logging
 
 from ecoaliface.simple import ECoalController
@@ -11,14 +12,17 @@ from homeassistant.const import (
     CONF_SENSORS,
     CONF_SWITCHES,
     CONF_USERNAME,
+    Platform,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.discovery import load_platform
+from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "ecoal_boiler"
-DATA_ECOAL_BOILER = "data_" + DOMAIN
+DATA_ECOAL_BOILER = f"data_{DOMAIN}"
 
 DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "admin"
@@ -79,7 +83,7 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-def setup(hass, hass_config):
+def setup(hass: HomeAssistant, hass_config: ConfigType) -> bool:
     """Set up global ECoalController instance same for sensors and switches."""
 
     conf = hass_config[DOMAIN]
@@ -91,7 +95,7 @@ def setup(hass, hass_config):
     if ecoal_contr.version is None:
         # Wrong credentials nor network config
         _LOGGER.error(
-            "Unable to read controller status from %s@%s" " (wrong host/credentials)",
+            "Unable to read controller status from %s@%s (wrong host/credentials)",
             username,
             host,
         )
@@ -100,8 +104,8 @@ def setup(hass, hass_config):
     hass.data[DATA_ECOAL_BOILER] = ecoal_contr
     # Setup switches
     switches = conf[CONF_SWITCHES][CONF_MONITORED_CONDITIONS]
-    load_platform(hass, "switch", DOMAIN, switches, hass_config)
+    load_platform(hass, Platform.SWITCH, DOMAIN, switches, hass_config)
     # Setup temp sensors
     sensors = conf[CONF_SENSORS][CONF_MONITORED_CONDITIONS]
-    load_platform(hass, "sensor", DOMAIN, sensors, hass_config)
+    load_platform(hass, Platform.SENSOR, DOMAIN, sensors, hass_config)
     return True

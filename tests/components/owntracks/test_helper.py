@@ -1,5 +1,7 @@
 """Test the owntracks_http platform."""
+
 from unittest.mock import patch
+
 import pytest
 
 from homeassistant.components.owntracks import helper
@@ -19,11 +21,11 @@ def mock_nacl_not_imported():
         yield
 
 
-def test_supports_encryption(nacl_imported):
+def test_supports_encryption(nacl_imported) -> None:
     """Test if env supports encryption."""
     assert helper.supports_encryption()
 
 
-def test_supports_encryption_failed(nacl_not_imported):
+def test_supports_encryption_failed(nacl_not_imported) -> None:
     """Test if env does not support encryption."""
     assert not helper.supports_encryption()
